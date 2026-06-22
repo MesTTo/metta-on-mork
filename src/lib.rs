@@ -83,7 +83,9 @@ impl GroundedRegistry {
     fn register(&mut self, atom: &Atom) {
         match atom {
             Atom::Grounded(g) if !g.as_grounded().is_mutable() => {
-                self.by_display.entry(g.to_string()).or_insert_with(|| atom.clone());
+                self.by_display
+                    .entry(g.to_string())
+                    .or_insert_with(|| atom.clone());
             }
             Atom::Expression(e) => {
                 for c in e.children() {
@@ -134,12 +136,14 @@ struct DecodeCtx<'a> {
 ///
 /// The byte-level matcher (`query_multi`) takes the trie by shared reference, so
 /// `query`/`visit` read the kernel through `&self` and mutation goes through
-/// `&mut self`. No interior `RefCell` is needed (DynSpace already provides one),
-/// which keeps `MorkSpace` itself `Sync` and removes a borrow per operation.
+/// `&mut self`. The full space is still not `Sync` because Hyperon's `SpaceCommon`,
+/// MORK/PathMap internals, and grounded atoms carry non-`Sync` state. Use
+/// [`MorkSnapshot`] when many threads need to query one immutable view.
 pub struct MorkSpace {
     kernel: MorkKernel,
     common: SpaceCommon,
     grounded: GroundedRegistry,
+    rejected_atoms: usize,
 }
 
 impl MorkSpace {
@@ -149,6 +153,7 @@ impl MorkSpace {
             kernel: MorkKernel::new(),
             common: SpaceCommon::default(),
             grounded: GroundedRegistry::default(),
+            rejected_atoms: 0,
         }
     }
 
@@ -160,6 +165,14 @@ impl MorkSpace {
     /// Whether the space holds no atoms.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Number of atoms rejected by `add` because they do not fit MORK's byte encoding.
+    ///
+    /// The common reasons are a symbol/display string longer than 63 bytes, expression
+    /// arity above 63, or more than 64 distinct variables in one atom.
+    pub fn rejected_atom_count(&self) -> usize {
+        self.rejected_atoms
     }
 
     /// Bulk-loads atoms from an S-expression source (whitespace-separated atoms)
@@ -196,11 +209,12 @@ impl MorkSpace {
 /// Adds a binding the way Hyperon's matcher does (matcher.rs `Bindings::from`): a
 /// variable bound to another variable is a variable *equality* (so equivalence classes
 /// merge and otherwise-equal results collapse instead of multiplying), and anything else
-/// is a value binding. Returns `None` if the addition splits or conflicts.
-fn bind_or_equate(b: Bindings, var: VariableAtom, atom: Atom) -> Option<Bindings> {
+/// is a value binding. Hyperon's insertion operations can split a single binding into
+/// several alternatives, so keep the whole set instead of forcing one result.
+fn bind_or_equate(set: BindingsSet, var: VariableAtom, atom: Atom) -> BindingsSet {
     match atom {
-        Atom::Variable(v) => b.add_var_equality(&var, &v).ok(),
-        _ => b.add_var_binding(var, atom).ok(),
+        Atom::Variable(v) => set.add_var_equality(&var, &v),
+        _ => set.add_var_binding(var, atom),
     }
 }
 
@@ -213,7 +227,10 @@ fn decode_var(ctx: &DecodeCtx, index: usize) -> Atom {
             return Atom::Variable(v.clone());
         }
     }
-    Atom::Variable(VariableAtom::new_id(format!("v{}_{}", ctx.ns, index), ctx.result_id))
+    Atom::Variable(VariableAtom::new_id(
+        format!("v{}_{}", ctx.ns, index),
+        ctx.result_id,
+    ))
 }
 
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
@@ -234,7 +251,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
     };
     MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
         let Err(bindings) = res else { return true };
-        let mut acc = Some(Bindings::new());
+        let mut acc = BindingsSet::single();
         // One fresh id for this whole result: every data variable decoded below shares it,
         // so the result is internally coreferent by name yet globally distinct from every
         // other result and query call. Without this, a data var `v1_0` from one match
@@ -281,7 +298,10 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
             } else {
                 VariableAtom::new_id(format!("v{}_{}", key_ns, key_idx), result_id)
             };
-            acc = acc.and_then(|b| bind_or_equate(b, var, atom));
+            acc = bind_or_equate(acc, var, atom);
+            if acc.is_empty() {
+                break;
+            }
         }
         // Live-value post-filter for mutable grounded atoms in the query (e.g. a State cell in a
         // `match` pattern). Each was encoded as a wildcard that matched any atom at its position;
@@ -289,21 +309,27 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
         // (`Atom`/`State` PartialEq derefs the cell), so a frozen byte image cannot over-match
         // (e3: `&state-active` matches the goal whose cell currently holds that value, not one
         // mutated since it was stored).
-        if let Some(b) = &acc {
-            for (idx, ref_atom) in &refs {
-                let ok = vars
-                    .get(*idx)
-                    .and_then(|v| b.resolve(v))
-                    .is_some_and(|captured| &captured == ref_atom);
-                if !ok {
-                    acc = None;
-                    break;
+        if !refs.is_empty() {
+            let mut filtered = BindingsSet::empty();
+            for b in acc {
+                let mut keep = true;
+                for (idx, ref_atom) in &refs {
+                    let ok = vars
+                        .get(*idx)
+                        .and_then(|v| b.resolve(v))
+                        .is_some_and(|captured| &captured == ref_atom);
+                    if !ok {
+                        keep = false;
+                        break;
+                    }
+                }
+                if keep {
+                    filtered.push(b);
                 }
             }
+            acc = filtered;
         }
-        if let Some(b) = acc {
-            set.push(b);
-        }
+        set.extend(acc);
         true
     });
     set
@@ -353,6 +379,7 @@ fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize,
 /// match anywhere sweeps all shards, which is where the parallelism pays.)
 pub struct ShardedMorkSpace {
     shards: Vec<PathMap<()>>,
+    rejected_atoms: usize,
 }
 
 impl ShardedMorkSpace {
@@ -360,6 +387,7 @@ impl ShardedMorkSpace {
     pub fn new(n_shards: usize) -> Self {
         Self {
             shards: (0..n_shards.max(1)).map(|_| PathMap::new()).collect(),
+            rejected_atoms: 0,
         }
     }
 
@@ -377,6 +405,7 @@ impl ShardedMorkSpace {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
         if encode_atom(atom, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly).is_err() {
+            self.rejected_atoms += 1;
             return false;
         }
         let s = self.shard_of(&bytes);
@@ -392,6 +421,11 @@ impl ShardedMorkSpace {
     /// Whether the space holds no atoms.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Number of atoms rejected by `add` because they do not fit MORK's byte encoding.
+    pub fn rejected_atom_count(&self) -> usize {
+        self.rejected_atoms
     }
 
     /// Number of shards.
@@ -648,6 +682,8 @@ impl SpaceMut for MorkSpace {
         let mut sink = GroundedSink::Store(&mut self.grounded);
         if encode_atom(&atom, &mut vars, &mut bytes, &mut sink).is_ok() {
             self.kernel.btm.insert(&bytes, ());
+        } else {
+            self.rejected_atoms += 1;
         }
     }
 
@@ -692,8 +728,13 @@ impl std::fmt::Display for MorkSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperon::space::grounding::GroundingSpace;
     use hyperon_atom::Atom;
+    use proptest::prelude::*;
+    use static_assertions::assert_impl_all;
     use std::cell::RefCell;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
 
     fn parent(a: &str, b: &str) -> Atom {
@@ -736,6 +777,288 @@ mod tests {
         b.resolve(&VariableAtom::new(name))
     }
 
+    #[derive(Clone, Debug)]
+    enum GenAtom {
+        Sym(u8),
+        Var(u8),
+        Expr(Vec<GenAtom>),
+    }
+
+    #[derive(Clone, Debug)]
+    struct BindingOp {
+        var: u8,
+        value: GenAtom,
+    }
+
+    fn query_vars() -> Vec<VariableAtom> {
+        vec![
+            VariableAtom::new("x"),
+            VariableAtom::new("y"),
+            VariableAtom::new_id("v1_0", 10_001),
+            VariableAtom::new_id("v1_1", 10_001),
+        ]
+    }
+
+    fn gen_atom_to_atom(atom: &GenAtom, vars: &[VariableAtom]) -> Atom {
+        match atom {
+            GenAtom::Sym(i) => Atom::sym(format!("s{i}")),
+            GenAtom::Var(i) => Atom::Variable(vars[*i as usize % vars.len()].clone()),
+            GenAtom::Expr(children) => Atom::expr(
+                children
+                    .iter()
+                    .map(|child| gen_atom_to_atom(child, vars))
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    fn arb_atom() -> impl Strategy<Value = GenAtom> {
+        let leaf = prop_oneof![
+            (0u8..8).prop_map(GenAtom::Sym),
+            (0u8..4).prop_map(GenAtom::Var)
+        ];
+        leaf.prop_recursive(4, 32, 4, |inner| {
+            prop::collection::vec(inner, 1..=4).prop_map(GenAtom::Expr)
+        })
+    }
+
+    fn arb_ground_atom() -> impl Strategy<Value = GenAtom> {
+        (0u8..8)
+            .prop_map(GenAtom::Sym)
+            .prop_recursive(4, 32, 4, |inner| {
+                prop::collection::vec(inner, 1..=4).prop_map(GenAtom::Expr)
+            })
+    }
+
+    fn arb_binding_op() -> impl Strategy<Value = BindingOp> {
+        (0u8..4, arb_atom()).prop_map(|(var, value)| BindingOp { var, value })
+    }
+
+    fn canonical_atom_with_vars(atom: &Atom, vars: &mut HashMap<VariableAtom, usize>) -> String {
+        match atom {
+            Atom::Symbol(s) => format!("S({})", s.name()),
+            Atom::Variable(v) => {
+                let next = vars.len();
+                let id = *vars.entry(v.clone()).or_insert(next);
+                format!("V{id}")
+            }
+            Atom::Grounded(g) => format!("G({g})"),
+            Atom::Expression(e) => {
+                let children = e
+                    .children()
+                    .iter()
+                    .map(|child| canonical_atom_with_vars(child, vars))
+                    .collect::<Vec<_>>();
+                format!("E({})", children.join(" "))
+            }
+        }
+    }
+
+    fn canonical_atom(atom: &Atom) -> String {
+        canonical_atom_with_vars(atom, &mut HashMap::new())
+    }
+
+    fn query_variables(atom: &Atom) -> Vec<VariableAtom> {
+        let mut seen = HashSet::new();
+        let mut vars = Vec::new();
+        for var in atom.iter().filter_type::<&VariableAtom>() {
+            if seen.insert(var.clone()) {
+                vars.push(var.clone());
+            }
+        }
+        vars
+    }
+
+    fn projected_results(results: &BindingsSet, query_vars: &[VariableAtom]) -> Vec<Vec<String>> {
+        let mut rows = results
+            .iter()
+            .map(|bindings| {
+                let mut canonical_vars = HashMap::new();
+                query_vars
+                    .iter()
+                    .map(|var| {
+                        let value = bindings
+                            .resolve(var)
+                            .unwrap_or_else(|| Atom::Variable(var.clone()));
+                        format!(
+                            "{}={}",
+                            var.name(),
+                            canonical_atom_with_vars(&value, &mut canonical_vars)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    fn insert_unique_atoms(atoms: &[GenAtom]) -> (GroundingSpace, MorkSpace) {
+        let vars = query_vars();
+        let mut seen = BTreeSet::new();
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        for atom in atoms {
+            let atom = gen_atom_to_atom(atom, &vars);
+            if seen.insert(canonical_atom(&atom)) {
+                ground.add(atom.clone());
+                mork.add(atom);
+            }
+        }
+        (ground, mork)
+    }
+
+    assert_impl_all!(MorkSnapshot: Send, Sync);
+
+    proptest! {
+        #[test]
+        fn binding_construction_never_emits_merge_panic(ops in prop::collection::vec(arb_binding_op(), 0..32)) {
+            let vars = query_vars();
+            let mut set = BindingsSet::single();
+            for op in ops {
+                let var = vars[op.var as usize % vars.len()].clone();
+                let value = gen_atom_to_atom(&op.value, &vars);
+                set = bind_or_equate(set, var, value);
+            }
+
+            for bindings in set.iter() {
+                let merge_result = catch_unwind(AssertUnwindSafe(|| Bindings::new().merge(bindings)));
+                prop_assert!(merge_result.is_ok());
+                let iter_result = catch_unwind(AssertUnwindSafe(|| bindings.iter().collect::<Vec<_>>()));
+                prop_assert!(iter_result.is_ok());
+            }
+        }
+
+        #[test]
+        fn codec_round_trips_symbols_exprs_and_variable_coreference(atom in arb_atom()) {
+            let vars = query_vars();
+            let atom = gen_atom_to_atom(&atom, &vars);
+            let mut encoded_vars = Vec::new();
+            let mut bytes = Vec::new();
+            let mut sink = GroundedSink::ValueOnly;
+            prop_assume!(encode_atom(&atom, &mut encoded_vars, &mut bytes, &mut sink).is_ok());
+
+            let mut pos = 0usize;
+            let mut ctx = DecodeCtx {
+                ns: 1,
+                var_counter: 0,
+                grounded: None,
+                query_vars: &[],
+                result_id: next_variable_id(),
+            };
+            let decoded = decode_atom(&bytes, &mut pos, &mut ctx);
+
+            prop_assert_eq!(pos, bytes.len());
+            prop_assert_eq!(decoded.as_ref().map(canonical_atom), Some(canonical_atom(&atom)));
+        }
+
+        #[test]
+        fn query_matches_grounding_space_on_small_ground_spaces(
+            atoms in prop::collection::vec(arb_ground_atom(), 0..12),
+            query in arb_atom(),
+        ) {
+            let vars = query_vars();
+            let query = gen_atom_to_atom(&query, &vars);
+            let query_vars = query_variables(&query);
+            let (ground, mork) = insert_unique_atoms(&atoms);
+
+            let ground_results = ground.query(&query);
+            let mork_results = mork.query(&query);
+
+            prop_assert_eq!(
+                projected_results(&mork_results, &query_vars),
+                projected_results(&ground_results, &query_vars)
+            );
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+    struct StateCellModel {
+        depth: u8,
+        live: [u8; 2],
+        query: u8,
+    }
+
+    impl StateCellModel {
+        fn live_matches(&self) -> Vec<usize> {
+            self.live
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, value)| (*value == self.query).then_some(idx))
+                .collect()
+        }
+
+        fn reference_matches(&self) -> Vec<usize> {
+            (0..self.live.len())
+                .filter(|idx| self.live[*idx] == self.query)
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+    enum StateCellAction {
+        SetCell { id: usize, value: u8 },
+        SetQuery(u8),
+    }
+
+    struct StateCellSystem;
+
+    impl stateright::Model for StateCellSystem {
+        type State = StateCellModel;
+        type Action = StateCellAction;
+
+        fn init_states(&self) -> Vec<Self::State> {
+            vec![StateCellModel {
+                depth: 0,
+                live: [0, 1],
+                query: 0,
+            }]
+        }
+
+        fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
+            if state.depth >= 4 {
+                return;
+            }
+            for id in 0..state.live.len() {
+                for value in 0..=1 {
+                    actions.push(StateCellAction::SetCell { id, value });
+                }
+            }
+            for value in 0..=1 {
+                actions.push(StateCellAction::SetQuery(value));
+            }
+        }
+
+        fn next_state(
+            &self,
+            last_state: &Self::State,
+            action: Self::Action,
+        ) -> Option<Self::State> {
+            let mut state = last_state.clone();
+            state.depth += 1;
+            match action {
+                StateCellAction::SetCell { id, value } => state.live[id] = value,
+                StateCellAction::SetQuery(value) => state.query = value,
+            }
+            Some(state)
+        }
+
+        fn properties(&self) -> Vec<stateright::Property<Self>> {
+            vec![stateright::Property::<Self>::always(
+                "live-value match equals reference",
+                |_, state| state.live_matches() == state.reference_matches(),
+            )]
+        }
+    }
+
+    #[test]
+    fn stateright_state_cell_model_checks_live_value_matching() {
+        use stateright::{Checker, Model};
+
+        let checker = StateCellSystem.checker().spawn_bfs().join();
+        checker.assert_properties();
+    }
+
     /// Two cells holding the same value stored in different atoms must stay distinct (identity,
     /// not display), mutation through one must be visible on query (Rc sharing), and a query
     /// holding a cell must match a stored cell by *current* value (the live-value post-filter).
@@ -744,25 +1067,47 @@ mod tests {
         let mut space = MorkSpace::new();
         let a = MutCell::new(0);
         let b = MutCell::new(0); // same value as `a`, but a distinct cell
-        space.add(Atom::expr([Atom::sym("box"), Atom::sym("A"), Atom::gnd(a.clone())]));
-        space.add(Atom::expr([Atom::sym("box"), Atom::sym("B"), Atom::gnd(b.clone())]));
+        space.add(Atom::expr([
+            Atom::sym("box"),
+            Atom::sym("A"),
+            Atom::gnd(a.clone()),
+        ]));
+        space.add(Atom::expr([
+            Atom::sym("box"),
+            Atom::sym("B"),
+            Atom::gnd(b.clone()),
+        ]));
 
         // Identity: mutate A's cell to 7; B's stays 0 (no display-key collision).
         a.set(7);
         let qa = Atom::expr([Atom::sym("box"), Atom::sym("A"), Atom::var("x")]);
         let qb = Atom::expr([Atom::sym("box"), Atom::sym("B"), Atom::var("x")]);
-        assert_eq!(resolve(space.query(&qa).iter().next().unwrap(), "x"), Some(Atom::gnd(MutCell::new(7))));
-        assert_eq!(resolve(space.query(&qb).iter().next().unwrap(), "x"), Some(Atom::gnd(MutCell::new(0))));
+        assert_eq!(
+            resolve(space.query(&qa).iter().next().unwrap(), "x"),
+            Some(Atom::gnd(MutCell::new(7)))
+        );
+        assert_eq!(
+            resolve(space.query(&qb).iter().next().unwrap(), "x"),
+            Some(Atom::gnd(MutCell::new(0)))
+        );
 
         // Live-value match: a query cell holding 0 matches only B (A now holds 7).
         let probe = MutCell::new(0);
         let qmatch = Atom::expr([Atom::sym("box"), Atom::var("k"), Atom::gnd(probe.clone())]);
-        let ks: Vec<Atom> = space.query(&qmatch).iter().filter_map(|bn| resolve(bn, "k")).collect();
+        let ks: Vec<Atom> = space
+            .query(&qmatch)
+            .iter()
+            .filter_map(|bn| resolve(bn, "k"))
+            .collect();
         assert_eq!(ks, vec![Atom::sym("B")]);
 
         // After mutating the probe to 7, the same query now matches only A.
         probe.set(7);
-        let ks: Vec<Atom> = space.query(&qmatch).iter().filter_map(|bn| resolve(bn, "k")).collect();
+        let ks: Vec<Atom> = space
+            .query(&qmatch)
+            .iter()
+            .filter_map(|bn| resolve(bn, "k"))
+            .collect();
         assert_eq!(ks, vec![Atom::sym("A")]);
     }
 
@@ -770,9 +1115,31 @@ mod tests {
     fn add_and_count() {
         let mut space = MorkSpace::new();
         assert_eq!(space.atom_count(), Some(0));
+        assert_eq!(space.rejected_atom_count(), 0);
         space.add(parent("Tom", "Bob"));
         space.add(parent("Bob", "Ann"));
         assert_eq!(space.atom_count(), Some(2));
+        assert_eq!(space.rejected_atom_count(), 0);
+    }
+
+    #[test]
+    fn overlong_symbol_add_is_reported() {
+        let mut space = MorkSpace::new();
+        let overlong = Atom::sym("x".repeat(MAX_FIELD + 1));
+        space.add(overlong);
+
+        assert_eq!(space.atom_count(), Some(0));
+        assert_eq!(space.rejected_atom_count(), 1);
+    }
+
+    #[test]
+    fn sharded_overlong_symbol_add_is_reported() {
+        let mut space = ShardedMorkSpace::new(4);
+        let overlong = Atom::sym("x".repeat(MAX_FIELD + 1));
+
+        assert!(!space.add(&overlong));
+        assert_eq!(space.len(), 0);
+        assert_eq!(space.rejected_atom_count(), 1);
     }
 
     #[test]
@@ -803,7 +1170,11 @@ mod tests {
         let results = space.query(&q);
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results.iter().next().unwrap().resolve(&VariableAtom::new("child")),
+            results
+                .iter()
+                .next()
+                .unwrap()
+                .resolve(&VariableAtom::new("child")),
             Some(Atom::sym("Bob"))
         );
     }
@@ -816,6 +1187,12 @@ mod tests {
         let q = Atom::expr([Atom::sym("parent"), Atom::var("p"), Atom::var("c")]);
         let results = space.query(&q);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn dynspace_wraps_mork_space_for_interpreter_use() {
+        let space = hyperon_space::DynSpace::new(MorkSpace::new());
+        assert_eq!(space.borrow().atom_count(), Some(0));
     }
 
     #[test]
@@ -922,6 +1299,10 @@ mod tests {
         assert_eq!(space.atom_count(), Some(target));
         let mut counter = Counter(0);
         space.visit(&mut counter).unwrap();
-        assert_eq!(counter.0, target, "MORK visit enumerated {} of {}", counter.0, target);
+        assert_eq!(
+            counter.0, target,
+            "MORK visit enumerated {} of {}",
+            counter.0, target
+        );
     }
 }

@@ -12,5 +12,11 @@ mork = { path = "../mork-latest-linalg/kernel" }
 pathmap = { path = "../PathMap", features = ["jemalloc", "arena_compact", "nightly"] }
 rayon = "1"
 
+[dev-dependencies]
+hyperon = { path = "../hyperon-experimental/lib", default-features = false, features = ["pkg_mgmt"] }
+proptest = "1.11.0"
+static_assertions = "1.1.0"
+stateright = "0.31.0"
+
 [features]
 default = []

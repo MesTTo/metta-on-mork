@@ -70,13 +70,19 @@ incomplete and currently breaks correctness, and would enlarge short symbols any
 
 ## Limitations (honest)
 
-- **`RefCell`, so `!Sync`.** `query` is `&self` while MORK matching needs `&mut` to
-  the trie cursor. A `&self` matching path would restore `Sync`.
-- **Symbolic atoms.** Symbols, expressions, and variables are supported. Grounded
-  atoms encode via their `Display` (as a symbol), not as native grounded values.
+- **Full `MorkSpace` is not `Sync`.** `query` is `&self`, but Hyperon's
+  `SpaceCommon`, MORK/PathMap internals, and grounded atoms carry non-`Sync` state.
+  Use `MorkSnapshot` for `Send + Sync` read-only parallel querying.
+- **Grounded atom boundaries.** Immutable grounded atoms are content-addressed by
+  display string. Mutable grounded atoms, such as `State`, are stored by per-instance
+  identity and matched by current live value. Snapshots and sharded spaces carry no
+  grounded registry, so they are for immutable content-addressed data.
+- **`remove` of mutable-grounded atoms.** `remove` uses the content key. An atom
+  stored by mutable identity id cannot be removed by reconstructing the value key.
 - **Single-pattern queries.** Conjunctive (`,`-glued) sub-queries are not yet split
-  into a join.
-- **Symbol/arity ≤ 63** (MORK's 6-bit fields).
+  into a native MORK multi-factor join.
+- **Symbol/arity <= 63** (MORK's 6-bit fields). `add` rejects atoms outside that
+  encoding and increments `rejected_atom_count()`.
 
 ## Layout
 
