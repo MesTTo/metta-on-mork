@@ -21,6 +21,7 @@ use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
 use mork::__mork_expr::{byte_item, item_byte, Expr, Tag};
 use mork::space::Space as MorkKernel;
+use pathmap::PathMap;
 
 /// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
 const MAX_FIELD: usize = 63;
@@ -62,44 +63,72 @@ impl MorkSpace {
     }
 
     fn query_inner(&self, query: &Atom) -> BindingsSet {
-        // Encode the pattern directly into the `(, <pattern>)` wrapper query_multi
-        // expects, tracking variables in introduction order so binding key (0, i)
-        // maps to the i-th variable. One buffer, no intermediate copy.
-        let mut vars: Vec<VariableAtom> = Vec::new();
-        let mut wrapped = Vec::with_capacity(64);
-        wrapped.push(item_byte(Tag::Arity(2)));
-        wrapped.push(item_byte(Tag::SymbolSize(1)));
-        wrapped.push(b',');
-        if encode_atom(query, &mut vars, &mut wrapped).is_err() {
-            return BindingsSet::empty();
-        }
+        query_btm(&self.kernel.btm, query)
+    }
 
-        let mut set = BindingsSet::empty();
-        let pat_expr = Expr {
-            ptr: wrapped.as_mut_ptr(),
-        };
-        MorkKernel::query_multi(&self.kernel.btm, pat_expr, |res, _loc| {
-            if let Ok(_) = res {
-                return true;
+    /// A `Send + Sync` read-only snapshot for data-parallel querying: a cheap
+    /// copy-on-write clone of the trie that many threads can query concurrently.
+    /// MORK's `PathMap` is `Send + Sync`, so this is the parallel querying that
+    /// Hyperon's `Rc<RefCell>` spaces (issue #410) cannot express.
+    pub fn snapshot(&self) -> MorkSnapshot {
+        MorkSnapshot {
+            btm: self.kernel.btm.clone(),
+        }
+    }
+}
+
+/// The byte-level query against a bare trie, shared by `MorkSpace` and the
+/// `Send + Sync` `MorkSnapshot`.
+fn query_btm(btm: &PathMap<()>, query: &Atom) -> BindingsSet {
+    let mut vars: Vec<VariableAtom> = Vec::new();
+    let mut wrapped = Vec::with_capacity(64);
+    wrapped.push(item_byte(Tag::Arity(2)));
+    wrapped.push(item_byte(Tag::SymbolSize(1)));
+    wrapped.push(b',');
+    if encode_atom(query, &mut vars, &mut wrapped).is_err() {
+        return BindingsSet::empty();
+    }
+    let mut set = BindingsSet::empty();
+    let pat_expr = Expr {
+        ptr: wrapped.as_mut_ptr(),
+    };
+    MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
+        let Err(bindings) = res else { return true };
+        let mut acc = Some(Bindings::new());
+        for (i, var) in vars.iter().enumerate() {
+            let Some(env) = bindings.get(&(0u8, i as u8)) else {
+                continue;
+            };
+            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
+            let mut pos = 0usize;
+            if let Some(atom) = decode_atom(span, &mut pos) {
+                acc = acc.and_then(|b| b.add_var_binding(var.clone(), atom).ok());
             }
-            let Err(bindings) = res else { unreachable!() };
-            let mut acc = Some(Bindings::new());
-            for (i, var) in vars.iter().enumerate() {
-                let Some(env) = bindings.get(&(0u8, i as u8)) else {
-                    continue;
-                };
-                let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
-                let mut pos = 0usize;
-                if let Some(atom) = decode_atom(span, &mut pos) {
-                    acc = acc.and_then(|b| b.add_var_binding(var.clone(), atom).ok());
-                }
-            }
-            if let Some(b) = acc {
-                set.push(b);
-            }
-            true
-        });
-        set
+        }
+        if let Some(b) = acc {
+            set.push(b);
+        }
+        true
+    });
+    set
+}
+
+/// A `Send + Sync` read-only snapshot of a space's atoms (a copy-on-write clone of
+/// the MORK trie). Construct with [`MorkSpace::snapshot`]; share one across threads
+/// (e.g. `Arc<MorkSnapshot>`) for concurrent queries.
+pub struct MorkSnapshot {
+    btm: PathMap<()>,
+}
+
+impl MorkSnapshot {
+    /// Query the snapshot; safe to call concurrently from many threads.
+    pub fn query(&self, query: &Atom) -> BindingsSet {
+        query_btm(&self.btm, query)
+    }
+
+    /// Number of atoms in the snapshot.
+    pub fn len(&self) -> usize {
+        self.btm.val_count()
     }
 }
 
