@@ -30,7 +30,7 @@ what you can build.
 
 ## The optimized MORK fork
 
-This crate targets a personal, optimized fork of the MORK kernel
+This crate runs on an optimized fork of the MORK kernel
 ([github.com/MesTTo/MORK](https://github.com/MesTTo/MORK)) and of PathMap
 ([github.com/MesTTo/PathMap](https://github.com/MesTTo/PathMap)). The fork keeps MORK's design
 and adds the work that makes it hold up at scale.
