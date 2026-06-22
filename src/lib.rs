@@ -146,6 +146,17 @@ impl MorkSpace {
     }
 }
 
+/// Adds a binding the way Hyperon's matcher does (matcher.rs `Bindings::from`): a
+/// variable bound to another variable is a variable *equality* (so equivalence classes
+/// merge and otherwise-equal results collapse instead of multiplying), and anything else
+/// is a value binding. Returns `None` if the addition splits or conflicts.
+fn bind_or_equate(b: Bindings, var: VariableAtom, atom: Atom) -> Option<Bindings> {
+    match atom {
+        Atom::Variable(v) => b.add_var_equality(&var, &v).ok(),
+        _ => b.add_var_binding(var, atom).ok(),
+    }
+}
+
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
 fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
@@ -177,7 +188,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
             let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
             let mut pos = 0usize;
             if let Some(atom) = decode_atom(span, &mut pos, &mut ctx) {
-                acc = acc.and_then(|b| b.add_var_binding(var.clone(), atom).ok());
+                acc = acc.and_then(|b| bind_or_equate(b, var.clone(), atom));
             }
         }
         // Data-side variable bindings: a variable that lives in a stored atom and got
@@ -195,7 +206,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
             let mut dctx = DecodeCtx { var_counter: 0, grounded: Some(&reg) };
             if let Some(atom) = decode_atom(span, &mut pos, &mut dctx) {
                 let name = VariableAtom::new(format!("v{}", idx));
-                acc = acc.and_then(|b| b.add_var_binding(name, atom).ok());
+                acc = acc.and_then(|b| bind_or_equate(b, name, atom));
             }
         }
         if let Some(b) = acc {
