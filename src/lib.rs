@@ -13,7 +13,6 @@
 //! symbols are stored as raw bytes rather than interned tokens.)
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 
 use hyperon_atom::matcher::{Bindings, BindingsSet};
 use hyperon_atom::{Atom, VariableAtom};
@@ -28,10 +27,12 @@ const MAX_FIELD: usize = 63;
 
 /// A Hyperon atomspace backed by the MORK kernel.
 ///
-/// The kernel is behind a `RefCell` because `query` is `&self` while MORK matching
-/// needs `&mut` access to the trie cursor; a query borrows mutably for its duration.
+/// The byte-level matcher (`query_multi`) takes the trie by shared reference, so
+/// `query`/`visit` read the kernel through `&self` and mutation goes through
+/// `&mut self`. No interior `RefCell` is needed (DynSpace already provides one),
+/// which keeps `MorkSpace` itself `Sync` and removes a borrow per operation.
 pub struct MorkSpace {
-    kernel: RefCell<MorkKernel>,
+    kernel: MorkKernel,
     common: SpaceCommon,
 }
 
@@ -39,14 +40,14 @@ impl MorkSpace {
     /// Creates an empty space.
     pub fn new() -> Self {
         Self {
-            kernel: RefCell::new(MorkKernel::new()),
+            kernel: MorkKernel::new(),
             common: SpaceCommon::default(),
         }
     }
 
     /// Number of atoms currently stored (MORK `PathMap::val_count`).
     pub fn len(&self) -> usize {
-        self.kernel.borrow().btm.val_count()
+        self.kernel.btm.val_count()
     }
 
     /// Whether the space holds no atoms.
@@ -57,30 +58,27 @@ impl MorkSpace {
     /// Bulk-loads atoms from an S-expression source (whitespace-separated atoms)
     /// through MORK's parser. Convenient for large loads.
     pub fn add_sexpr_text(&mut self, text: &str) -> Result<usize, String> {
-        self.kernel.get_mut().add_all_sexpr(text.as_bytes())
+        self.kernel.add_all_sexpr(text.as_bytes())
     }
 
     fn query_inner(&self, query: &Atom) -> BindingsSet {
-        // Encode the pattern, tracking variables in introduction order so binding
-        // key (0, i) maps to the i-th variable.
+        // Encode the pattern directly into the `(, <pattern>)` wrapper query_multi
+        // expects, tracking variables in introduction order so binding key (0, i)
+        // maps to the i-th variable. One buffer, no intermediate copy.
         let mut vars: Vec<VariableAtom> = Vec::new();
-        let mut pat = Vec::new();
-        if encode_atom(query, &mut vars, &mut pat).is_err() {
-            return BindingsSet::empty();
-        }
-        // Wrap as the single-factor conjunction `(, <pattern>)` query_multi expects.
-        let mut wrapped = Vec::with_capacity(pat.len() + 3);
+        let mut wrapped = Vec::with_capacity(64);
         wrapped.push(item_byte(Tag::Arity(2)));
         wrapped.push(item_byte(Tag::SymbolSize(1)));
         wrapped.push(b',');
-        wrapped.extend_from_slice(&pat);
+        if encode_atom(query, &mut vars, &mut wrapped).is_err() {
+            return BindingsSet::empty();
+        }
 
-        let kernel = self.kernel.borrow();
         let mut set = BindingsSet::empty();
         let pat_expr = Expr {
             ptr: wrapped.as_mut_ptr(),
         };
-        MorkKernel::query_multi(&kernel.btm, pat_expr, |res, _loc| {
+        MorkKernel::query_multi(&self.kernel.btm, pat_expr, |res, _loc| {
             if let Ok(_) = res {
                 return true;
             }
@@ -193,8 +191,7 @@ impl Space for MorkSpace {
 
     fn visit(&self, v: &mut dyn SpaceVisitor) -> Result<(), ()> {
         use pathmap::zipper::{ZipperIteration, ZipperMoving};
-        let kernel = self.kernel.borrow();
-        let mut rz = kernel.btm.read_zipper();
+        let mut rz = self.kernel.btm.read_zipper();
         while rz.to_next_val() {
             let atom_bytes = rz.path();
             let mut pos = 0;
@@ -215,7 +212,7 @@ impl SpaceMut for MorkSpace {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
         if encode_atom(&atom, &mut vars, &mut bytes).is_ok() {
-            self.kernel.get_mut().btm.insert(&bytes, ());
+            self.kernel.btm.insert(&bytes, ());
         }
     }
 
@@ -225,7 +222,7 @@ impl SpaceMut for MorkSpace {
         if encode_atom(atom, &mut vars, &mut bytes).is_err() {
             return false;
         }
-        self.kernel.get_mut().btm.remove(&bytes).is_some()
+        self.kernel.btm.remove(&bytes).is_some()
     }
 
     fn replace(&mut self, from: &Atom, to: Atom) -> bool {
