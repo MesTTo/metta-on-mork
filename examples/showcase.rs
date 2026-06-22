@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! MeTTa-On-Mork showcase: Hyperon's MeTTa, on the MORK kernel.
 //! Scale, indexed query, real MM2 forward-chaining computation, and data-parallel
 //! reasoning -- the HE-MeTTa -> {MORK} path, end to end, with live numbers.

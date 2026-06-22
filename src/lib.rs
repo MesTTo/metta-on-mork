@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! MORK kernel as an in-process Hyperon atomspace backend (MeTTa-On-Mork).
 //!
 //! [`MorkSpace`] implements Hyperon's [`Space`]/[`SpaceMut`] over the optimized MORK

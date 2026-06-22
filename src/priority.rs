@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Priority ordering for evaluation control (Hyperon issue #448).
 //!
 //! Grabbed from F1R3FLY MeTTaTron's `backend/eval/priority.rs` and ported to Hyperon

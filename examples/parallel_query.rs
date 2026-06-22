@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Parallel concurrent queries on a MORK-backed space. MORK's PathMap is Send+Sync,
 //! so one shared space serves many querying threads at once -- the parallelism that
 //! Hyperon's Rc<RefCell> DynSpace (issue #410) cannot express.

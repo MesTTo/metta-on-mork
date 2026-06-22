@@ -36,6 +36,20 @@ throughput, not crash-avoidance. A faithful #1076 repro is future work.
 2. **Codec (this crate):** a direct byte-level `Atom`↔trie-bytes codec, no text
    round-trip.
 
+## Parallel querying (read-only snapshots)
+
+A `MorkSnapshot` is `Send + Sync`, so read-only point queries parallelize across threads.
+The kernel's match path used to take a global query-metrics mutex on every query, which
+collapsed 16-thread throughput to ~3.6M q/s (below the 8-thread number). Accumulating those
+metrics per-thread instead removed the contention, and point-query throughput then scales
+cleanly on a Ryzen 9950X (16 cores / 32 threads):
+
+| threads | 1    | 8     | 16    | 32    |
+|---------|------|-------|-------|-------|
+| q/s     | 1.9M | 12.7M | 17.6M | 26.1M |
+
+(`cargo run --release --example parallel_query` exercises the `Send + Sync` snapshot.)
+
 ## Use
 
 ```rust
@@ -89,3 +103,10 @@ incomplete and currently breaks correctness, and would enlarge short symbols any
 - `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the byte-level codec.
 - `examples/scale_showcase.rs` — the load + query benchmark.
 - `examples/query_warmup.rs` — cold-vs-warm query timing.
+- `examples/parallel_query.rs` — parallel querying on a `Send + Sync` snapshot.
+
+## License
+
+MIT (`SPDX-License-Identifier: MIT`). See [LICENSE](LICENSE). Each source file carries an
+SPDX header. The dependencies keep their own licenses: Hyperon (`hyperon-atom`,
+`hyperon-space`, `hyperon-common`) and MORK/PathMap.

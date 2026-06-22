@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Is MorkSpace's query cost per-query or a cold first-query (COW) artifact?
 //! Load 500k, then time successive queries.
 
