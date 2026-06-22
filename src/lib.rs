@@ -65,6 +65,16 @@ impl MorkSpace {
         self.kernel.add_all_sexpr(text.as_bytes())
     }
 
+    /// Runs MORK's MM2 exec engine -- the forward-chaining `(exec <loc> (, <src>)
+    /// (, <tpl>))` rules in the space -- for up to `steps` exec steps (each runs a
+    /// rule to fixpoint), returning the steps taken. This is the *computation*
+    /// engine (CeTTa's `mork:step!`): the optimized kernel exec path that the six
+    /// benchmarks accelerate. Load facts and `exec` rules with `add`/`add_sexpr_text`
+    /// first, then `step`, then `query` the results.
+    pub fn step(&mut self, steps: usize) -> usize {
+        self.kernel.metta_calculus(steps)
+    }
+
     fn query_inner(&self, query: &Atom) -> BindingsSet {
         query_btm(&self.kernel.btm, query)
     }
@@ -480,5 +490,43 @@ mod tests {
         // A partial pattern still sweeps every shard and finds the one match.
         let one = Atom::expr([Atom::sym("edge"), Atom::sym("a500"), Atom::var("y")]);
         assert_eq!(space.par_count_matches(&one), 1);
+    }
+
+    #[test]
+    fn mm2_exec_runs_transitive_closure() {
+        // Load facts + a forward-chaining exec rule, run MORK's MM2 exec to fixpoint,
+        // then read the transitive closure back through the byte-level query.
+        let mut space = MorkSpace::new();
+        space
+            .add_sexpr_text(
+                "(edge a b)\n(edge b c)\n(edge c d)\n\
+                 (path a b)\n(path b c)\n(path c d)\n\
+                 (exec 0 (, (edge $x $y) (path $y $z)) (, (path $x $z)))\n",
+            )
+            .unwrap();
+        // The plain exec rule is one-shot, so re-add it each round and step until the
+        // closure stops growing (a tiny driver; semi-naive fixpoint is feature-gated).
+        let mut prev = 0;
+        for _ in 0..8 {
+            space
+                .add_sexpr_text("(exec 0 (, (edge $x $y) (path $y $z)) (, (path $x $z)))\n")
+                .unwrap();
+            space.step(1);
+            let now = space.len();
+            if now == prev {
+                break;
+            }
+            prev = now;
+        }
+        let q = Atom::expr([Atom::sym("path"), Atom::sym("a"), Atom::var("z")]);
+        let mut zs: Vec<String> = space
+            .query(&q)
+            .iter()
+            .filter_map(|b| b.resolve(&VariableAtom::new("z")))
+            .map(|a| a.to_string())
+            .collect();
+        zs.sort();
+        zs.dedup();
+        assert_eq!(zs, vec!["b", "c", "d"]); // transitive closure from a: b, c, d
     }
 }
