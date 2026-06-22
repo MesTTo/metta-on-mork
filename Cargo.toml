@@ -1,0 +1,14 @@
+[package]
+name = "mork-hyperon-space"
+version = "0.1.0"
+edition = "2021"
+description = "MORK kernel as an in-process Hyperon atomspace backend (Space/SpaceMut)"
+
+[dependencies]
+hyperon-atom = { path = "../hyperon-experimental/hyperon-atom" }
+hyperon-space = { path = "../hyperon-experimental/hyperon-space" }
+hyperon-common = { path = "../hyperon-experimental/hyperon-common" }
+mork = { path = "../mork-latest-linalg/kernel" }
+
+[features]
+default = []
