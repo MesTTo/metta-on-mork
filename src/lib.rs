@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use hyperon_atom::matcher::{Bindings, BindingsSet};
-use hyperon_atom::{next_variable_id, Atom, VariableAtom};
+use hyperon_atom::{next_variable_id, Atom, Grounded, GroundedAtom, VariableAtom};
 use hyperon_common::FlexRef;
 use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
@@ -33,33 +33,56 @@ const MAX_FIELD: usize = 63;
 /// Reserved first byte of a grounded atom's symbol encoding. No real MeTTa symbol
 /// starts with NUL, so it cleanly separates a grounded `Atom` from a plain symbol in
 /// the trie. The bytes after it are the grounded atom's display string, the key into
-/// [`GroundedRegistry`].
+/// [`GroundedRegistry`]. Used for content-addressable (immutable) grounded atoms:
+/// numbers, bools, strings, and operation symbols, whose display is their identity.
 const GROUNDED_MARK: u8 = 0x00;
+
+/// Reserved first byte for a *mutable* grounded atom (`Grounded::is_mutable`), e.g. a
+/// `State` cell. Its display is unstable, so it is addressed by a stable per-instance
+/// id (the 8 bytes after this marker) rather than by content; the live `Atom` is held
+/// in [`GroundedRegistry::by_id`]. Like `0x00`, no real symbol starts with `0x01`.
+const GROUNDED_REF_MARK: u8 = 0x01;
+
+/// Returns true if `atom` is a *mutable* grounded atom (`Grounded::is_mutable`), e.g. a
+/// `State` cell, whose display is unstable so it cannot be content-addressed.
+fn is_mutable_grounded(atom: &Atom) -> bool {
+    matches!(atom, Atom::Grounded(g) if g.as_grounded().is_mutable())
+}
 
 /// Side table that makes grounded atoms round-trip losslessly through the byte trie.
 ///
-/// MORK's encoding has no grounded type, so a Hyperon `Grounded` atom (a number, a
-/// bool, an arithmetic op like `<=`) is stored as a marker symbol carrying its
-/// display string, and the original `Atom` is kept here keyed by that string.
-/// `decode` rebuilds the exact grounded atom by cloning the canonical instance.
-/// Filled on `add`, read on `decode`; encoding is deterministic from the display
-/// string and needs no lookup, so query patterns encode to the same bytes as stored
-/// data without touching the table.
+/// MORK's encoding has no grounded type, so a Hyperon `Grounded` atom is kept here and
+/// referenced from the trie by a marker symbol. Two storage disciplines, chosen by
+/// [`Grounded::is_mutable`]:
 ///
-/// Identity is by display string: two grounded atoms that print the same are treated
-/// as equal (true for `Number`/`Bool`/`String`/op symbols). Snapshots and sharded
-/// shards carry no registry, so they decode grounded atoms as bare symbols.
+/// - **Immutable** atoms (numbers, bools, strings, operation symbols like `<=`): keyed
+///   by display string in `by_display`. Encoding is deterministic from the display, so a
+///   query pattern encodes to the same bytes as stored data without touching the table,
+///   and two atoms that print the same are the same. This is content addressing.
+/// - **Mutable** atoms (a `State` cell): keyed by a fresh per-instance id in `by_id`,
+///   because the display goes stale on `change-state!` and two cells with equal values
+///   are still distinct. The stored `Atom` is an `Rc`-sharing clone, so the registered
+///   handle and the live cell mutate together (the handle-table model of the minimal
+///   interpreter's `World.store`). Matching a mutable atom is by *live* value, handled
+///   as a post-filter in [`query_btm`], not by these bytes.
+///
+/// Snapshots and sharded shards carry no registry, so they decode grounded atoms as bare
+/// symbols (and do not support mutable-cell identity).
 #[derive(Default, Clone)]
 struct GroundedRegistry {
     by_display: HashMap<String, Atom>,
+    by_id: HashMap<u64, Atom>,
+    next_id: u64,
 }
 
 impl GroundedRegistry {
-    /// Records every grounded atom in `atom` (recursing into expressions) so it can
-    /// be reconstructed on decode. First instance per display string wins.
+    /// Records every *immutable* grounded atom in `atom` (recursing into expressions) by
+    /// display so it can be reconstructed on decode. Mutable atoms are skipped here; they
+    /// are interned by identity in [`intern_mutable`](Self::intern_mutable) during encode.
+    /// First instance per display string wins.
     fn register(&mut self, atom: &Atom) {
         match atom {
-            Atom::Grounded(g) => {
+            Atom::Grounded(g) if !g.as_grounded().is_mutable() => {
                 self.by_display.entry(g.to_string()).or_insert_with(|| atom.clone());
             }
             Atom::Expression(e) => {
@@ -71,8 +94,21 @@ impl GroundedRegistry {
         }
     }
 
+    /// Interns a mutable grounded atom by a fresh id, storing an `Rc`-sharing clone so the
+    /// registered handle tracks the live cell. Returns the id to embed in the trie bytes.
+    fn intern_mutable(&mut self, atom: &Atom) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.by_id.insert(id, atom.clone());
+        id
+    }
+
     fn get(&self, display: &str) -> Option<Atom> {
         self.by_display.get(display).cloned()
+    }
+
+    fn get_by_id(&self, id: u64) -> Option<Atom> {
+        self.by_id.get(&id).cloned()
     }
 }
 
@@ -183,7 +219,7 @@ fn decode_var(ctx: &DecodeCtx, index: usize) -> Atom {
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
 fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
-    let Some((mut wrapped, vars)) = wrap_pattern(query) else {
+    let Some((mut wrapped, vars, refs)) = wrap_pattern(query) else {
         return BindingsSet::empty();
     };
     // Decode must recover grounded atoms that appear in the query itself (the `4` in
@@ -247,6 +283,24 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
             };
             acc = acc.and_then(|b| bind_or_equate(b, var, atom));
         }
+        // Live-value post-filter for mutable grounded atoms in the query (e.g. a State cell in a
+        // `match` pattern). Each was encoded as a wildcard that matched any atom at its position;
+        // keep the result only if the captured atom equals the query atom by *current* value
+        // (`Atom`/`State` PartialEq derefs the cell), so a frozen byte image cannot over-match
+        // (e3: `&state-active` matches the goal whose cell currently holds that value, not one
+        // mutated since it was stored).
+        if let Some(b) = &acc {
+            for (idx, ref_atom) in &refs {
+                let ok = vars
+                    .get(*idx)
+                    .and_then(|v| b.resolve(v))
+                    .is_some_and(|captured| &captured == ref_atom);
+                if !ok {
+                    acc = None;
+                    break;
+                }
+            }
+        }
         if let Some(b) = acc {
             set.push(b);
         }
@@ -275,17 +329,20 @@ impl MorkSnapshot {
 }
 
 /// Encodes `query` into the `(, <pattern>)` wrapper `query_multi` expects, returning
-/// the bytes and the variables in introduction order.
-fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>)> {
+/// the bytes, the variables in introduction order, and the mutable-grounded positions
+/// `(var index, atom)` to post-filter by live value (empty for the common case).
+fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize, Atom)>)> {
     let mut vars = Vec::new();
+    let mut refs = Vec::new();
     let mut wrapped = Vec::with_capacity(64);
     wrapped.push(item_byte(Tag::Arity(2)));
     wrapped.push(item_byte(Tag::SymbolSize(1)));
     wrapped.push(b',');
-    if encode_atom(query, &mut vars, &mut wrapped).is_err() {
+    let mut sink = GroundedSink::Query(&mut refs);
+    if encode_atom(query, &mut vars, &mut wrapped, &mut sink).is_err() {
         return None;
     }
-    Some((wrapped, vars))
+    Some((wrapped, vars, refs))
 }
 
 /// A hash-prefix-sharded MORK space for data-parallel whole-space sweeps -- the
@@ -314,10 +371,12 @@ impl ShardedMorkSpace {
     }
 
     /// Adds an atom to its hash-determined shard. Returns false on an unencodable atom.
+    /// A sharded shard has no registry, so a mutable grounded atom falls back to its
+    /// (unstable) display key; sharded sweeps are for immutable, content-addressed data.
     pub fn add(&mut self, atom: &Atom) -> bool {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
-        if encode_atom(atom, &mut vars, &mut bytes).is_err() {
+        if encode_atom(atom, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly).is_err() {
             return false;
         }
         let s = self.shard_of(&bytes);
@@ -343,7 +402,7 @@ impl ShardedMorkSpace {
     /// Counts atoms matching `pattern`, sweeping every shard in parallel (rayon).
     pub fn par_count_matches(&self, pattern: &Atom) -> usize {
         use rayon::prelude::*;
-        let Some((mut wrapped, _vars)) = wrap_pattern(pattern) else {
+        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(pattern) else {
             return 0;
         };
         // Pass the pattern-buffer address as a usize (Send) and rebuild the Expr in
@@ -362,7 +421,7 @@ impl ShardedMorkSpace {
 
     /// Sequential baseline of [`par_count_matches`].
     pub fn count_matches(&self, pattern: &Atom) -> usize {
-        let Some((mut wrapped, _vars)) = wrap_pattern(pattern) else {
+        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(pattern) else {
             return 0;
         };
         let pat_expr = Expr {
@@ -381,13 +440,55 @@ impl Default for MorkSpace {
     }
 }
 
+/// How `encode_atom` handles a *mutable* grounded atom (`Grounded::is_mutable`), which is
+/// not content-addressable so cannot just be written as its display bytes.
+enum GroundedSink<'a> {
+    /// Storing into the trie: intern the mutable atom by identity and embed its id, and
+    /// register immutable grounded atoms by display for decode.
+    Store(&'a mut GroundedRegistry),
+    /// Encoding a query pattern: replace the mutable atom with a fresh wildcard variable and
+    /// record `(var index, the atom)` so [`query_btm`] can post-filter matches by live value.
+    Query(&'a mut Vec<(usize, Atom)>),
+    /// No mutable-atom support (sharded shards, removal): fall back to the display key, which is
+    /// unstable for a mutable atom but the only option without a registry to intern into.
+    ValueOnly,
+}
+
 /// Walks a Hyperon `Atom` into MORK's preorder byte encoding, recording variables
 /// in first-occurrence order (`NewVar` introduces, later occurrences `VarRef` back).
-/// Errors when a symbol or arity exceeds MORK's 63 limit.
-fn encode_atom(atom: &Atom, vars: &mut Vec<VariableAtom>, out: &mut Vec<u8>) -> Result<(), ()> {
+/// Errors when a symbol or arity exceeds MORK's 63 limit. `sink` decides how a mutable
+/// grounded atom (a `State` cell) is handled: interned by identity when storing, turned
+/// into a post-filtered wildcard when querying.
+fn encode_atom(
+    atom: &Atom,
+    vars: &mut Vec<VariableAtom>,
+    out: &mut Vec<u8>,
+    sink: &mut GroundedSink,
+) -> Result<(), ()> {
     match atom {
         Atom::Symbol(s) => encode_symbol(s.name(), out),
-        Atom::Grounded(g) => encode_grounded(&g.to_string(), out),
+        Atom::Grounded(g) if g.as_grounded().is_mutable() => match sink {
+            // Stored: address the cell by a fresh identity id; the live `Atom` goes in the registry.
+            GroundedSink::Store(reg) => encode_grounded_ref(reg.intern_mutable(atom), out),
+            // Queried: a wildcard that matches any atom at this position, recorded for the live-value
+            // post-filter. Its NewVar slot is a real (fresh, unique) query var so var indexing stays
+            // aligned; the caller never reads it, the post-filter does.
+            GroundedSink::Query(refs) => {
+                out.push(item_byte(Tag::NewVar));
+                vars.push(VariableAtom::new("state").make_unique());
+                refs.push((vars.len() - 1, atom.clone()));
+                Ok(())
+            }
+            GroundedSink::ValueOnly => encode_grounded_value(&g.to_string(), out),
+        },
+        Atom::Grounded(g) => {
+            // Immutable grounded atom: content-addressed by display. Register it on the store path
+            // so decode can rebuild the exact instance (a query path registers via query_btm).
+            if let GroundedSink::Store(reg) = sink {
+                reg.register(atom);
+            }
+            encode_grounded_value(&g.to_string(), out)
+        }
         Atom::Expression(e) => {
             let children = e.children();
             if children.len() > MAX_FIELD {
@@ -395,7 +496,7 @@ fn encode_atom(atom: &Atom, vars: &mut Vec<VariableAtom>, out: &mut Vec<u8>) -> 
             }
             out.push(item_byte(Tag::Arity(children.len() as u8)));
             for child in children {
-                encode_atom(child, vars, out)?;
+                encode_atom(child, vars, out, sink)?;
             }
             Ok(())
         }
@@ -423,11 +524,10 @@ fn encode_symbol(name: &str, out: &mut Vec<u8>) -> Result<(), ()> {
     Ok(())
 }
 
-/// Encodes a grounded atom as a marker symbol: [`GROUNDED_MARK`] followed by the
-/// atom's display string. `decode_atom` recognises the marker and rebuilds the
-/// original `Atom` from the [`GroundedRegistry`]. The display plus marker must fit
-/// MORK's 63-byte symbol field.
-fn encode_grounded(display: &str, out: &mut Vec<u8>) -> Result<(), ()> {
+/// Encodes an immutable grounded atom as a marker symbol: [`GROUNDED_MARK`] followed by the
+/// atom's display string. `decode_atom` recognises the marker and rebuilds the original `Atom`
+/// from the [`GroundedRegistry`]. The display plus marker must fit MORK's 63-byte symbol field.
+fn encode_grounded_value(display: &str, out: &mut Vec<u8>) -> Result<(), ()> {
     let bytes = display.as_bytes();
     if bytes.is_empty() || bytes.len() + 1 > MAX_FIELD {
         return Err(());
@@ -435,6 +535,16 @@ fn encode_grounded(display: &str, out: &mut Vec<u8>) -> Result<(), ()> {
     out.push(item_byte(Tag::SymbolSize((bytes.len() + 1) as u8)));
     out.push(GROUNDED_MARK);
     out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Encodes a mutable grounded atom by identity: [`GROUNDED_REF_MARK`] followed by the 8-byte
+/// registry id. `decode_atom` rebuilds the live cell via [`GroundedRegistry::get_by_id`].
+fn encode_grounded_ref(id: u64, out: &mut Vec<u8>) -> Result<(), ()> {
+    let id_bytes = id.to_le_bytes();
+    out.push(item_byte(Tag::SymbolSize((id_bytes.len() + 1) as u8)));
+    out.push(GROUNDED_REF_MARK);
+    out.extend_from_slice(&id_bytes);
     Ok(())
 }
 
@@ -451,12 +561,23 @@ fn decode_atom(bytes: &[u8], pos: &mut usize, ctx: &mut DecodeCtx) -> Option<Ato
             *pos = end;
             if let Some((&GROUNDED_MARK, disp_bytes)) = raw.split_first() {
                 let disp = std::str::from_utf8(disp_bytes).ok()?;
-                // Rebuild the grounded atom from the registry; without one (snapshot or
+                // Rebuild the immutable grounded atom from the registry; without one (snapshot or
                 // sharded shard) fall back to a bare symbol of the display string.
                 return Some(
                     ctx.grounded
                         .and_then(|reg| reg.get(disp))
                         .unwrap_or_else(|| Atom::sym(disp)),
+                );
+            }
+            if let Some((&GROUNDED_REF_MARK, id_bytes)) = raw.split_first() {
+                // A mutable grounded atom (a State cell): the 8 id bytes index the registry's
+                // identity table, returning an Rc-sharing clone whose live value reflects any
+                // change-state! since it was stored. Without a registry, a readable placeholder.
+                let id = u64::from_le_bytes(id_bytes.try_into().ok()?);
+                return Some(
+                    ctx.grounded
+                        .and_then(|reg| reg.get_by_id(id))
+                        .unwrap_or_else(|| Atom::sym(format!("<state-{id}>"))),
                 );
             }
             let name = std::str::from_utf8(raw).ok()?;
@@ -522,8 +643,10 @@ impl SpaceMut for MorkSpace {
     fn add(&mut self, atom: Atom) {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
-        if encode_atom(&atom, &mut vars, &mut bytes).is_ok() {
-            self.grounded.register(&atom);
+        // Store sink: registers immutable grounded atoms by display and interns mutable cells
+        // (State) by identity into `self.grounded` as it walks the atom.
+        let mut sink = GroundedSink::Store(&mut self.grounded);
+        if encode_atom(&atom, &mut vars, &mut bytes, &mut sink).is_ok() {
             self.kernel.btm.insert(&bytes, ());
         }
     }
@@ -531,7 +654,10 @@ impl SpaceMut for MorkSpace {
     fn remove(&mut self, atom: &Atom) -> bool {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
-        if encode_atom(atom, &mut vars, &mut bytes).is_err() {
+        // ValueOnly: removal matches stored bytes by content. An atom containing a mutable cell
+        // was stored by identity id, so it cannot be removed by value here (not exercised; the
+        // interpreter retracts via the cell, not by re-encoding the State).
+        if encode_atom(atom, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly).is_err() {
             return false;
         }
         self.kernel.btm.remove(&bytes).is_some()
@@ -567,9 +693,77 @@ impl std::fmt::Display for MorkSpace {
 mod tests {
     use super::*;
     use hyperon_atom::Atom;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn parent(a: &str, b: &str) -> Atom {
         Atom::expr([Atom::sym("parent"), Atom::sym(a), Atom::sym(b)])
+    }
+
+    /// A minimal mutable grounded cell mirroring Hyperon's `StateAtom`: an `Rc<RefCell>`
+    /// whose value can change in place, with by-current-value equality and `is_mutable`
+    /// true. Lets the codec's mutable-grounded path be tested without the hyperon stdlib.
+    #[derive(Clone, Debug)]
+    struct MutCell(Rc<RefCell<i64>>);
+    impl MutCell {
+        fn new(v: i64) -> Self {
+            Self(Rc::new(RefCell::new(v)))
+        }
+        fn set(&self, v: i64) {
+            *self.0.borrow_mut() = v;
+        }
+    }
+    impl std::fmt::Display for MutCell {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "(Cell {})", self.0.borrow())
+        }
+    }
+    impl PartialEq for MutCell {
+        fn eq(&self, other: &Self) -> bool {
+            *self.0.borrow() == *other.0.borrow()
+        }
+    }
+    impl Grounded for MutCell {
+        fn type_(&self) -> Atom {
+            Atom::sym("Cell")
+        }
+        fn is_mutable(&self) -> bool {
+            true
+        }
+    }
+
+    fn resolve(b: &Bindings, name: &str) -> Option<Atom> {
+        b.resolve(&VariableAtom::new(name))
+    }
+
+    /// Two cells holding the same value stored in different atoms must stay distinct (identity,
+    /// not display), mutation through one must be visible on query (Rc sharing), and a query
+    /// holding a cell must match a stored cell by *current* value (the live-value post-filter).
+    #[test]
+    fn mutable_grounded_identity_and_live_value_match() {
+        let mut space = MorkSpace::new();
+        let a = MutCell::new(0);
+        let b = MutCell::new(0); // same value as `a`, but a distinct cell
+        space.add(Atom::expr([Atom::sym("box"), Atom::sym("A"), Atom::gnd(a.clone())]));
+        space.add(Atom::expr([Atom::sym("box"), Atom::sym("B"), Atom::gnd(b.clone())]));
+
+        // Identity: mutate A's cell to 7; B's stays 0 (no display-key collision).
+        a.set(7);
+        let qa = Atom::expr([Atom::sym("box"), Atom::sym("A"), Atom::var("x")]);
+        let qb = Atom::expr([Atom::sym("box"), Atom::sym("B"), Atom::var("x")]);
+        assert_eq!(resolve(space.query(&qa).iter().next().unwrap(), "x"), Some(Atom::gnd(MutCell::new(7))));
+        assert_eq!(resolve(space.query(&qb).iter().next().unwrap(), "x"), Some(Atom::gnd(MutCell::new(0))));
+
+        // Live-value match: a query cell holding 0 matches only B (A now holds 7).
+        let probe = MutCell::new(0);
+        let qmatch = Atom::expr([Atom::sym("box"), Atom::var("k"), Atom::gnd(probe.clone())]);
+        let ks: Vec<Atom> = space.query(&qmatch).iter().filter_map(|bn| resolve(bn, "k")).collect();
+        assert_eq!(ks, vec![Atom::sym("B")]);
+
+        // After mutating the probe to 7, the same query now matches only A.
+        probe.set(7);
+        let ks: Vec<Atom> = space.query(&qmatch).iter().filter_map(|bn| resolve(bn, "k")).collect();
+        assert_eq!(ks, vec![Atom::sym("A")]);
     }
 
     #[test]
