@@ -926,6 +926,7 @@ dependencies = [
  "hyperon-space",
  "mork",
  "pathmap",
+ "rayon",
 ]
 
 [[package]]

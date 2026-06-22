@@ -80,14 +80,9 @@ impl MorkSpace {
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
 fn query_btm(btm: &PathMap<()>, query: &Atom) -> BindingsSet {
-    let mut vars: Vec<VariableAtom> = Vec::new();
-    let mut wrapped = Vec::with_capacity(64);
-    wrapped.push(item_byte(Tag::Arity(2)));
-    wrapped.push(item_byte(Tag::SymbolSize(1)));
-    wrapped.push(b',');
-    if encode_atom(query, &mut vars, &mut wrapped).is_err() {
+    let Some((mut wrapped, vars)) = wrap_pattern(query) else {
         return BindingsSet::empty();
-    }
+    };
     let mut set = BindingsSet::empty();
     let pat_expr = Expr {
         ptr: wrapped.as_mut_ptr(),
@@ -129,6 +124,107 @@ impl MorkSnapshot {
     /// Number of atoms in the snapshot.
     pub fn len(&self) -> usize {
         self.btm.val_count()
+    }
+}
+
+/// Encodes `query` into the `(, <pattern>)` wrapper `query_multi` expects, returning
+/// the bytes and the variables in introduction order.
+fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>)> {
+    let mut vars = Vec::new();
+    let mut wrapped = Vec::with_capacity(64);
+    wrapped.push(item_byte(Tag::Arity(2)));
+    wrapped.push(item_byte(Tag::SymbolSize(1)));
+    wrapped.push(b',');
+    if encode_atom(query, &mut vars, &mut wrapped).is_err() {
+        return None;
+    }
+    Some((wrapped, vars))
+}
+
+/// A hash-prefix-sharded MORK space for data-parallel whole-space sweeps -- the
+/// ShardZipper symbolic-CPU path (Goertzel 2025). Atoms are partitioned across
+/// `n_shards` PathMap tries by a hash of their byte encoding; each shard is a
+/// locally-sweepable sub-trie, and a whole-space match-count sweeps all shards in
+/// parallel with rayon. (A ground point query lands in one shard; a pattern that can
+/// match anywhere sweeps all shards, which is where the parallelism pays.)
+pub struct ShardedMorkSpace {
+    shards: Vec<PathMap<()>>,
+}
+
+impl ShardedMorkSpace {
+    /// Creates an empty sharded space with `n_shards` shards (at least one).
+    pub fn new(n_shards: usize) -> Self {
+        Self {
+            shards: (0..n_shards.max(1)).map(|_| PathMap::new()).collect(),
+        }
+    }
+
+    fn shard_of(&self, bytes: &[u8]) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        (h.finish() as usize) % self.shards.len()
+    }
+
+    /// Adds an atom to its hash-determined shard. Returns false on an unencodable atom.
+    pub fn add(&mut self, atom: &Atom) -> bool {
+        let mut vars = Vec::new();
+        let mut bytes = Vec::new();
+        if encode_atom(atom, &mut vars, &mut bytes).is_err() {
+            return false;
+        }
+        let s = self.shard_of(&bytes);
+        self.shards[s].insert(&bytes, ());
+        true
+    }
+
+    /// Total atoms across all shards.
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.val_count()).sum()
+    }
+
+    /// Whether the space holds no atoms.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of shards.
+    pub fn shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Counts atoms matching `pattern`, sweeping every shard in parallel (rayon).
+    pub fn par_count_matches(&self, pattern: &Atom) -> usize {
+        use rayon::prelude::*;
+        let Some((mut wrapped, _vars)) = wrap_pattern(pattern) else {
+            return 0;
+        };
+        // Pass the pattern-buffer address as a usize (Send) and rebuild the Expr in
+        // each task; the buffer is alive for the whole sweep and read-only.
+        let pat_ptr = wrapped.as_mut_ptr() as usize;
+        self.shards
+            .par_iter()
+            .map(|shard| {
+                let pat_expr = Expr {
+                    ptr: pat_ptr as *mut u8,
+                };
+                MorkKernel::query_multi(shard, pat_expr, |_, _| true)
+            })
+            .sum()
+    }
+
+    /// Sequential baseline of [`par_count_matches`].
+    pub fn count_matches(&self, pattern: &Atom) -> usize {
+        let Some((mut wrapped, _vars)) = wrap_pattern(pattern) else {
+            return 0;
+        };
+        let pat_expr = Expr {
+            ptr: wrapped.as_mut_ptr(),
+        };
+        self.shards
+            .iter()
+            .map(|shard| MorkKernel::query_multi(shard, pat_expr, |_, _| true))
+            .sum()
     }
 }
 
@@ -362,5 +458,24 @@ mod tests {
         assert_eq!(space.atom_count(), Some(20_000));
         let q = Atom::expr([Atom::sym("edge"), Atom::sym("n10000"), Atom::var("dst")]);
         assert_eq!(space.query(&q).len(), 1);
+    }
+
+    #[test]
+    fn sharded_parallel_sweep_matches_sequential() {
+        let mut space = ShardedMorkSpace::new(8);
+        for i in 0..1000u32 {
+            space.add(&Atom::expr([
+                Atom::sym("edge"),
+                Atom::sym(format!("a{}", i)),
+                Atom::sym(format!("b{}", i)),
+            ]));
+        }
+        assert_eq!(space.len(), 1000);
+        let all = Atom::expr([Atom::sym("edge"), Atom::var("x"), Atom::var("y")]);
+        assert_eq!(space.count_matches(&all), 1000);
+        assert_eq!(space.par_count_matches(&all), 1000);
+        // A partial pattern still sweeps every shard and finds the one match.
+        let one = Atom::expr([Atom::sym("edge"), Atom::sym("a500"), Atom::var("y")]);
+        assert_eq!(space.par_count_matches(&one), 1);
     }
 }
