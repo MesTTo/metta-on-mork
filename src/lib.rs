@@ -23,6 +23,9 @@ use mork::__mork_expr::{byte_item, item_byte, Expr, Tag};
 use mork::space::Space as MorkKernel;
 use pathmap::PathMap;
 
+/// Priority ordering for evaluation control (Hyperon #448), grabbed from MeTTaTron.
+pub mod priority;
+
 /// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
 const MAX_FIELD: usize = 63;
 
