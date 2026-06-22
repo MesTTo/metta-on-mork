@@ -342,10 +342,57 @@ pub struct MorkSnapshot {
     btm: PathMap<()>,
 }
 
+/// A query pattern encoded once for repeated execution, so the per-query encode (the
+/// `wrap_pattern` allocation and atom walk) is paid a single time instead of every call.
+/// This is the in-process analog of the PeTTa<->MORK FFI bridge's prepared-count handle.
+/// Build with [`MorkSnapshot::prepare`]; the kernel reads the bytes without mutating them, so
+/// run it as many times as needed (hold one per thread for parallel use).
+pub struct PreparedQuery {
+    wrapped: Vec<u8>,
+    // Kept for a future binding-returning `query_prepared`; `count_prepared` needs only `wrapped`.
+    #[allow(dead_code)]
+    vars: Vec<VariableAtom>,
+    #[allow(dead_code)]
+    refs: Vec<(usize, Atom)>,
+}
+
 impl MorkSnapshot {
     /// Query the snapshot; safe to call concurrently from many threads.
     pub fn query(&self, query: &Atom) -> BindingsSet {
         query_btm(&self.btm, query, None)
+    }
+
+    /// Counts atoms matching `query` through the trie read path only, without decoding
+    /// bindings. Isolates the read-traversal cost from the per-result decode + `Bindings`
+    /// allocation, so the two can be compared under parallel load.
+    pub fn count_matches(&self, query: &Atom) -> usize {
+        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(query) else {
+            return 0;
+        };
+        let pat_expr = Expr {
+            ptr: wrapped.as_mut_ptr(),
+        };
+        MorkKernel::query_multi(&self.btm, pat_expr, |_res, _loc| true)
+    }
+
+    /// Encodes `query` into reusable bytes once, so the same pattern can be run many times
+    /// without re-paying the per-query encode (the `wrap_pattern` allocation + atom walk).
+    /// This is the prepared-query model proven by the PeTTa<->MORK FFI bridge
+    /// (`prepare_count` / `count_prepared`): hoist the encode out of the hot loop. Returns
+    /// `None` for an unencodable pattern (symbol/arity over 63).
+    pub fn prepare(&self, query: &Atom) -> Option<PreparedQuery> {
+        let (wrapped, vars, refs) = wrap_pattern(query)?;
+        Some(PreparedQuery { wrapped, vars, refs })
+    }
+
+    /// Counts matches of a [`PreparedQuery`] reusing its encoded bytes. The kernel reads the
+    /// pattern without mutating it (the FFI bridge runs a prepared count many times over one
+    /// handle), so the bytes are reused across calls; hold one `PreparedQuery` per thread.
+    pub fn count_prepared(&self, prepared: &PreparedQuery) -> usize {
+        let pat_expr = Expr {
+            ptr: prepared.wrapped.as_ptr() as *mut u8,
+        };
+        MorkKernel::query_multi(&self.btm, pat_expr, |_res, _loc| true)
     }
 
     /// Number of atoms in the snapshot.
@@ -736,6 +783,32 @@ mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
+
+    /// A prepared query encodes once and is reused across calls; it must give the same count
+    /// as `count_matches`/`query` on every call (the kernel reads the pattern without mutating
+    /// it), for both a point pattern and a wildcard.
+    #[test]
+    fn prepared_count_is_correct_and_reuse_stable() {
+        let mut space = MorkSpace::new();
+        for i in 0..200u32 {
+            space.add(Atom::expr([Atom::sym("e"), Atom::sym(format!("n{i}")), Atom::sym(format!("n{}", i + 1))]));
+        }
+        let snap = space.snapshot();
+
+        let point = Atom::expr([Atom::sym("e"), Atom::sym("n100"), Atom::var("d")]);
+        let pp = snap.prepare(&point).unwrap();
+        for _ in 0..8 {
+            assert_eq!(snap.count_prepared(&pp), 1, "prepared point count must be stable across reuse");
+            assert_eq!(snap.count_matches(&point), 1);
+            assert_eq!(snap.query(&point).len(), 1);
+        }
+
+        let wild = Atom::expr([Atom::sym("e"), Atom::var("a"), Atom::var("b")]);
+        let wp = snap.prepare(&wild).unwrap();
+        for _ in 0..8 {
+            assert_eq!(snap.count_prepared(&wp), 200, "prepared wildcard count must be stable across reuse");
+        }
+    }
 
     fn parent(a: &str, b: &str) -> Atom {
         Atom::expr([Atom::sym("parent"), Atom::sym(a), Atom::sym(b)])
