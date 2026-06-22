@@ -76,11 +76,18 @@ impl GroundedRegistry {
     }
 }
 
-/// Decode-time state: a running variable counter (so the i-th introduced variable and
-/// its back-references decode to the same name) and the optional grounded registry.
+/// Decode-time state: the namespace these bytes belong to (so variables are named by
+/// `(namespace, index)` and a data variable can't collide with a pattern variable), a
+/// running counter for first-occurrence variables, the optional grounded registry, and
+/// the query's own variables. Namespace 0 is the query pattern, so a namespace-0 variable
+/// decodes back to the caller's actual `VariableAtom` (preserving `$n` through the byte
+/// round-trip) rather than a fresh name; without this, evaluating `(Add $n (S Z))` returns
+/// an alpha-equivalent `(S $v0_0)` that the script's `assertEqual` against `(S $n)` rejects.
 struct DecodeCtx<'a> {
+    ns: u8,
     var_counter: usize,
     grounded: Option<&'a GroundedRegistry>,
+    query_vars: &'a [VariableAtom],
 }
 
 /// A Hyperon atomspace backed by the MORK kernel.
@@ -157,6 +164,18 @@ fn bind_or_equate(b: Bindings, var: VariableAtom, atom: Atom) -> Option<Bindings
     }
 }
 
+/// Decodes the variable at `index` in the current namespace. Namespace 0 is the query,
+/// so its variables are the caller's own (`query_vars[index]`), preserving `$n` through
+/// the round-trip; other namespaces (matched data atoms / factors) get `v{ns}_{index}`.
+fn decode_var(ctx: &DecodeCtx, index: usize) -> Atom {
+    if ctx.ns == 0 {
+        if let Some(v) = ctx.query_vars.get(index) {
+            return Atom::Variable(v.clone());
+        }
+    }
+    Atom::var(format!("v{}_{}", ctx.ns, index))
+}
+
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
 fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
@@ -176,38 +195,37 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
     MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
         let Err(bindings) = res else { return true };
         let mut acc = Some(Bindings::new());
-        // One decode context per matched record. The shared variable counter advances
-        // across the bound subterms in query order, which is their left-to-right order
-        // in the matched atom, so a data variable shared across several subterms (e.g.
-        // $q in (-> (→ $p $q) (→ $q $r) (→ $p $r))) decodes to one consistent name.
-        let mut ctx = DecodeCtx { var_counter: 0, grounded: Some(&reg) };
-        for (i, var) in vars.iter().enumerate() {
-            let Some(env) = bindings.get(&(0u8, i as u8)) else {
+        // Iterate every binding the unifier produced. The key (ns, idx) names a variable
+        // by its namespace -- 0 is the query pattern, >=1 a matched data atom / factor --
+        // and its index; the bound value's own variables live in the value's namespace
+        // `env.n`. Decode names a variable `v{ns}_{idx}`, so a data variable and a pattern
+        // variable can never collide. (Without this, evaluating (Add (S $n) Z) bound the
+        // data variable $x to the compound (S $n); both decoded to `v0`, yielding the
+        // spurious occurs-failing binding `v0 <- (S v0)` that dropped the whole result and
+        // stalled b1_equal_chain.) Query variables (ns 0) bind their real names so the
+        // result is in terms the caller asked for; data/factor variables bind `v{ns}_{idx}`
+        // for Hyperon's transitive `resolve` to chase.
+        for (&(key_ns, key_idx), env) in bindings.iter() {
+            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
+            let mut pos = 0usize;
+            let mut ctx = DecodeCtx {
+                var_counter: 0,
+                grounded: Some(&reg),
+                ns: env.n,
+                query_vars: &vars,
+            };
+            let Some(atom) = decode_atom(span, &mut pos, &mut ctx) else {
                 continue;
             };
-            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
-            let mut pos = 0usize;
-            if let Some(atom) = decode_atom(span, &mut pos, &mut ctx) {
-                acc = acc.and_then(|b| bind_or_equate(b, var.clone(), atom));
-            }
-        }
-        // Data-side variable bindings: a variable that lives in a stored atom and got
-        // bound to a subterm of the query. Evaluating (sqr 4) against the stored rule
-        // (= (sqr $x) (* $x $x)) binds the data-side $x <- 4; the interpreter then
-        // resolves $X = (* $x $x) to (* 4 4). The query-var values above decode a data
-        // variable with index j as `vj` (VarRef(j) -> vj), so bind `vj` to its value
-        // here and Hyperon's transitive `resolve` performs the substitution.
-        for (&(ns, idx), env) in bindings.iter() {
-            if ns != 1 {
-                continue;
-            }
-            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
-            let mut pos = 0usize;
-            let mut dctx = DecodeCtx { var_counter: 0, grounded: Some(&reg) };
-            if let Some(atom) = decode_atom(span, &mut pos, &mut dctx) {
-                let name = VariableAtom::new(format!("v{}", idx));
-                acc = acc.and_then(|b| bind_or_equate(b, name, atom));
-            }
+            let var = if key_ns == 0 {
+                match vars.get(key_idx as usize) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                }
+            } else {
+                VariableAtom::new(format!("v{}_{}", key_ns, key_idx))
+            };
+            acc = acc.and_then(|b| bind_or_equate(b, var, atom));
         }
         if let Some(b) = acc {
             set.push(b);
@@ -434,11 +452,11 @@ fn decode_atom(bytes: &[u8], pos: &mut usize, ctx: &mut DecodeCtx) -> Option<Ato
         // The n-th introduced variable and its back-references share one name, so the
         // coreference in stored atoms like (-> (→ $p $q) $p $q) survives the round-trip.
         Tag::NewVar => {
-            let name = format!("v{}", ctx.var_counter);
+            let idx = ctx.var_counter;
             ctx.var_counter += 1;
-            Some(Atom::var(name))
+            Some(decode_var(ctx, idx))
         }
-        Tag::VarRef(i) => Some(Atom::var(format!("v{}", i))),
+        Tag::VarRef(i) => Some(decode_var(ctx, i as usize)),
     }
 }
 
@@ -462,8 +480,10 @@ impl Space for MorkSpace {
             let atom_bytes = rz.path();
             let mut pos = 0;
             let mut ctx = DecodeCtx {
+                ns: 1,
                 var_counter: 0,
                 grounded: Some(&self.grounded),
+                query_vars: &[],
             };
             if let Some(atom) = decode_atom(atom_bytes, &mut pos, &mut ctx) {
                 v.accept(Cow::Owned(atom));
