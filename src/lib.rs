@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use hyperon_atom::matcher::{Bindings, BindingsSet};
-use hyperon_atom::{Atom, VariableAtom};
+use hyperon_atom::{next_variable_id, Atom, VariableAtom};
 use hyperon_common::FlexRef;
 use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
@@ -88,6 +88,10 @@ struct DecodeCtx<'a> {
     var_counter: usize,
     grounded: Option<&'a GroundedRegistry>,
     query_vars: &'a [VariableAtom],
+    /// Globally unique id stamped on every data variable decoded for one query result,
+    /// so two results (or two separate query calls, e.g. recursion levels) never produce
+    /// the same `VariableAtom` and alias when the interpreter threads their bindings.
+    result_id: usize,
 }
 
 /// A Hyperon atomspace backed by the MORK kernel.
@@ -173,7 +177,7 @@ fn decode_var(ctx: &DecodeCtx, index: usize) -> Atom {
             return Atom::Variable(v.clone());
         }
     }
-    Atom::var(format!("v{}_{}", ctx.ns, index))
+    Atom::Variable(VariableAtom::new_id(format!("v{}_{}", ctx.ns, index), ctx.result_id))
 }
 
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
@@ -195,6 +199,12 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
     MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
         let Err(bindings) = res else { return true };
         let mut acc = Some(Bindings::new());
+        // One fresh id for this whole result: every data variable decoded below shares it,
+        // so the result is internally coreferent by name yet globally distinct from every
+        // other result and query call. Without this, a data var `v1_0` from one match
+        // aliased a `v1_0` from a deeper recursion's match, and the interpreter's threaded
+        // bindings collapsed the branch to empty (b2 backchaining: mortal<-human<-And).
+        let result_id = next_variable_id();
         // Iterate every binding the unifier produced. The key (ns, idx) names a variable
         // by its namespace -- 0 is the query pattern, >=1 a matched data atom / factor --
         // and its index; the bound value's own variables live in the value's namespace
@@ -222,6 +232,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
                 grounded: Some(&reg),
                 ns: env.n,
                 query_vars: &vars,
+                result_id,
             };
             let Some(atom) = decode_atom(span, &mut pos, &mut ctx) else {
                 continue;
@@ -232,7 +243,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
                     None => continue,
                 }
             } else {
-                VariableAtom::new(format!("v{}_{}", key_ns, key_idx))
+                VariableAtom::new_id(format!("v{}_{}", key_ns, key_idx), result_id)
             };
             acc = acc.and_then(|b| bind_or_equate(b, var, atom));
         }
@@ -493,6 +504,7 @@ impl Space for MorkSpace {
                 var_counter: 0,
                 grounded: Some(&self.grounded),
                 query_vars: &[],
+                result_id: next_variable_id(),
             };
             if let Some(atom) = decode_atom(atom_bytes, &mut pos, &mut ctx) {
                 v.accept(Cow::Owned(atom));
