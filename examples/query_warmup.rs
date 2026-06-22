@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use hyperon_atom::Atom;
 use hyperon_space::{Space, SpaceMut};
-use mork_hyperon_space::MorkSpace;
+use metta_on_mork::MorkSpace;
 
 fn main() {
     let n = 500_000u32;

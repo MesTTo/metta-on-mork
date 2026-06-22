@@ -918,6 +918,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "metta-on-mork"
+version = "0.1.0"
+dependencies = [
+ "hyperon-atom",
+ "hyperon-common",
+ "hyperon-space",
+ "mork",
+ "pathmap",
+]
+
+[[package]]
 name = "mork"
 version = "0.1.0"
 dependencies = [
@@ -960,17 +971,6 @@ dependencies = [
  "pathmap",
  "regex",
  "typed-arena",
-]
-
-[[package]]
-name = "mork-hyperon-space"
-version = "0.1.0"
-dependencies = [
- "hyperon-atom",
- "hyperon-common",
- "hyperon-space",
- "mork",
- "pathmap",
 ]
 
 [[package]]

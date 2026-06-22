@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use hyperon_atom::Atom;
 use hyperon_space::{Space, SpaceMut};
-use mork_hyperon_space::MorkSpace;
+use metta_on_mork::MorkSpace;
 
 fn main() {
     for n in [10_000u32, 100_000, 500_000] {
