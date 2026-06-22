@@ -208,8 +208,17 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
         for (&(key_ns, key_idx), env) in bindings.iter() {
             let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
             let mut pos = 0usize;
+            // Seed the NewVar counter with `env.v`: the count of NewVars preceding this
+            // span in its base atom (maintained by ExprEnv::args). A captured sub-span is
+            // carved from the middle of an atom, so its `VarRef(i)` bytes index variables
+            // in the atom's *global* scope, and a `NewVar` inside it is the (env.v)-th
+            // variable of that scope, not the 0th. Decoding from 0 gave a binder var a
+            // local index that collided with an outer VarRef (e.g. (part-appl $f $x) ->
+            // (lambda $y ($f $x $y)) decoded the binder $y as v1_0 == $f, so $y absorbed
+            // $f's value `+`). Seeding from env.v aligns NewVar names with VarRef names,
+            // so a variable's binder and body occurrences share one name (consistent VBTO).
             let mut ctx = DecodeCtx {
-                var_counter: 0,
+                var_counter: env.v as usize,
                 grounded: Some(&reg),
                 ns: env.n,
                 query_vars: &vars,
