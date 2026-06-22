@@ -1,31 +1,47 @@
 # MeTTa-On-Mork
-The MORK kernel as an in-process [Hyperon](https://github.com/trueagi-io/hyperon-experimental) atomspace backend (MeTTa on MORK).
+
 The MORK kernel as an in-process [Hyperon](https://github.com/trueagi-io/hyperon-experimental)
 atomspace backend. `MorkSpace` implements Hyperon's `Space`/`SpaceMut` traits over
-MORK's PathMap trie and worst-case-optimal-join matcher, so a Hyperon atomspace
-gains MORK's scale and speed without a network hop or serialization boundary.
+MORK's PathMap trie and worst-case-optimal-join matcher, so a Hyperon atomspace runs
+on MORK's kernel with no network hop or serialization boundary.
 
-## Why
+## Head-to-head vs stock GroundingSpace
 
-hyperon-experimental issue #1076: the default `GroundingSpace` trie panics on the
-first query after roughly 1.9k–3k atoms. The same workload runs fine on MORK.
+Same workload (load N `(edge nK nK+1)` atoms, then a point query). MeTTa-On-Mork
+byte-level codec vs the stock Hyperon `GroundingSpace`:
 
-Measured here (`cargo run --release --example scale_showcase`):
+| N        | load (Grounding → Mork) | warm query (Grounding → Mork) |
+|----------|-------------------------|-------------------------------|
+| 100,000  | 132 ms → **11 ms**      | ~16 µs → **~2.4 µs**          |
+| 500,000  | 979 ms → **55 ms**      | ~16 µs → **~2.4 µs**          |
 
-| atoms   | load    | first query | result  |
-|---------|---------|-------------|---------|
-| 10,000  | ~1.0 ms | ~76 µs      | correct |
-| 100,000 | ~11 ms  | ~0.5 ms     | correct |
-| 500,000 | ~54 ms  | ~3.0 ms     | correct |
+Load is ~18× faster and a warm point query ~6× faster. A *cold* first query (a new
+query shape) is ~38 µs vs GroundingSpace's ~16 µs, constant in N either way.
+(`cargo run --release --example scale_showcase`, and the `grounding_bench` example
+in hyperon-experimental/lib for the baseline.)
 
-500,000 atoms is ~250× the scale that crashes the trie.
+Note on #1076: that issue is the GroundingSpace trie panicking on the first query
+after ~2k atoms for a specific workload (Project Dagaz). This synthetic edge workload
+does not trigger the panic — stock GroundingSpace handles it — so the win here is
+throughput, not crash-avoidance. A faithful #1076 repro is future work.
+
+## Two fixes that made it fast
+
+1. **Kernel (general):** `query_factor_plan` computed `btm.val_count()` — an O(space)
+   whole-trie count — on every query, to seed a shape side-index used only for
+   multi-factor ordering. A single-pattern query (the most common MeTTa shape) never
+   needs it. Computing it only for `sources.len() > 1` drops a 500k point query from
+   ~3 ms to ~3 µs. The multi-factor path is byte-identical, so the six core
+   benchmarks are unchanged. (Committed in the MORK kernel.)
+2. **Codec (this crate):** a direct byte-level `Atom`↔trie-bytes codec, no text
+   round-trip.
 
 ## Use
 
 ```rust
 use hyperon_atom::Atom;
 use hyperon_space::{Space, SpaceMut};
-use mork_hyperon_space::MorkSpace;
+use metta_on_mork::MorkSpace;
 
 let mut space = MorkSpace::new();
 space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Tom"), Atom::sym("Bob")]));
@@ -41,30 +57,29 @@ RUSTFLAGS="-C target-cpu=native" cargo +nightly test
 RUSTFLAGS="-C target-cpu=native" cargo +nightly run --release --example scale_showcase
 ```
 
-## How it works (v1)
+## How it works
 
-Atoms cross the boundary as S-expressions through MORK's own tested parser and
-serializer. `add`/`remove` go through `add_all_sexpr`/`remove_all_sexpr`; `query`
-encodes the pattern together with a variable-tuple template in one parse (so the
-template references the pattern's variables), runs MORK's `dump_sexpr`, and decodes
-each substituted tuple back into Hyperon `Bindings`. `atom_count` is
-`PathMap::val_count`; `visit` walks `dump_all_sexpr`.
+`encode_atom` walks a Hyperon `Atom` into MORK's preorder byte encoding
+(`Arity`/`SymbolSize`/`NewVar`/`VarRef`), tracking variables in introduction order;
+`decode_atom` walks the bytes back. `add`/`remove` insert/remove those bytes in the
+trie; `query` encodes the pattern, wraps it as `(, pattern)`, calls `query_multi`,
+and reads binding `(0, i)` for the i-th variable, decoding each bound sub-expression
+into an `Atom`; `atom_count` is `val_count`; `visit` iterates the trie with a read
+zipper. Symbols are stored as raw bytes (MORK's default; the `interning` feature is
+incomplete and currently breaks correctness, and would enlarge short symbols anyway).
 
-## v1 limitations (honest)
+## Limitations (honest)
 
-- **Text-mediated codec.** Atoms round-trip through S-expression text rather than a
-  direct byte-level `Atom`↔`Expr` codec. Already fast; a byte codec is the next
-  optimization.
-- **`RefCell`, so `!Sync`.** Hyperon's `query` is `&self` while MORK's parser interns
-  through `&mut`; v1 borrows mutably for a query. A `&self` interning path (via the
-  shared symbol-table handle) would restore `Sync`.
-- **Symbolic atoms only.** Symbols, expressions, and variables are fully supported.
-  Grounded atoms serialize via their `Display` (a symbol), not as native grounded
-  values; faithful grounded support needs a side table and execution semantics.
-- **Single-pattern queries.** Conjunctive (`,`-glued) sub-queries are not yet split.
-- **Symbol/arity limits.** MORK symbols are 1..=63 bytes and arity < 64.
+- **`RefCell`, so `!Sync`.** `query` is `&self` while MORK matching needs `&mut` to
+  the trie cursor. A `&self` matching path would restore `Sync`.
+- **Symbolic atoms.** Symbols, expressions, and variables are supported. Grounded
+  atoms encode via their `Display` (as a symbol), not as native grounded values.
+- **Single-pattern queries.** Conjunctive (`,`-glued) sub-queries are not yet split
+  into a join.
+- **Symbol/arity ≤ 63** (MORK's 6-bit fields).
 
 ## Layout
 
-- `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the text codec.
-- `examples/scale_showcase.rs` — the load + first-query benchmark above.
+- `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the byte-level codec.
+- `examples/scale_showcase.rs` — the load + query benchmark.
+- `examples/query_warmup.rs` — cold-vs-warm query timing.
