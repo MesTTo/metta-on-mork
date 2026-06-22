@@ -132,7 +132,7 @@ binding `(0, i)` for the i-th variable, decoding each bound sub-expression back 
 stored as raw bytes, which is MORK's default; the `interning` feature is incomplete, currently
 breaks correctness, and would enlarge short symbols anyway.
 
-## Limitations (honest)
+## Limitations
 
 - Full `MorkSpace` is not `Sync`. `query` is `&self`, but Hyperon's `SpaceCommon`, the MORK and
   PathMap internals, and grounded atoms carry non-`Sync` state. Use `MorkSnapshot` for
