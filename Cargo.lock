@@ -970,6 +970,7 @@ dependencies = [
  "hyperon-common",
  "hyperon-space",
  "mork",
+ "pathmap",
 ]
 
 [[package]]

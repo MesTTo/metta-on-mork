@@ -1,5 +1,5 @@
-# mork-hyperon-space
-
+# MeTTa-On-Mork
+The MORK kernel as an in-process [Hyperon](https://github.com/trueagi-io/hyperon-experimental) atomspace backend (MeTTa on MORK).
 The MORK kernel as an in-process [Hyperon](https://github.com/trueagi-io/hyperon-experimental)
 atomspace backend. `MorkSpace` implements Hyperon's `Space`/`SpaceMut` traits over
 MORK's PathMap trie and worst-case-optimal-join matcher, so a Hyperon atomspace

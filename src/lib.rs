@@ -1,14 +1,16 @@
-//! MORK kernel as an in-process Hyperon atomspace backend.
+//! MORK kernel as an in-process Hyperon atomspace backend (MeTTa-On-Mork).
 //!
 //! [`MorkSpace`] implements Hyperon's [`Space`]/[`SpaceMut`] over the optimized MORK
 //! kernel (a PathMap trie plus the worst-case-optimal-join matcher), so a Hyperon
-//! atomspace gains MORK's scale and speed. The motivating case is
-//! hyperon-experimental issue #1076: the default `GroundingSpace` trie panics after
-//! ~2k atoms on the first query; MORK handles far more without crashing.
+//! atomspace gains MORK's scale and speed. Motivated by hyperon-experimental #1076
+//! (the GroundingSpace trie panics on the first query past ~2k atoms).
 //!
-//! v1 is text-mediated: atoms cross the boundary as S-expressions through MORK's
-//! own tested parser/serializer (`add_all_sexpr`, `parse_sexpr`, `dump_sexpr`). A
-//! direct byte-level codec is a later optimization.
+//! The codec is **byte-level**: a Hyperon `Atom` is walked directly into MORK's
+//! expression-zipper byte encoding (`Arity`/`SymbolSize`/`NewVar`/`VarRef`) and
+//! inserted into the trie; a query encodes its pattern, calls `query_multi`, and
+//! decodes each bound sub-expression's bytes straight back into an `Atom`. No text
+//! round-trip, no per-query parsing. (Build uses MORK's default features, where
+//! symbols are stored as raw bytes rather than interned tokens.)
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -18,15 +20,16 @@ use hyperon_atom::{Atom, VariableAtom};
 use hyperon_common::FlexRef;
 use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
+use mork::__mork_expr::{byte_item, item_byte, Expr, Tag};
 use mork::space::Space as MorkKernel;
-use mork::__mork_expr::ExprEnv;
+
+/// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
+const MAX_FIELD: usize = 63;
 
 /// A Hyperon atomspace backed by the MORK kernel.
 ///
-/// The kernel sits behind a `RefCell` because Hyperon's `Space::query` is `&self`
-/// while MORK's parser interns symbols through a `&mut` entry point; v1 borrows
-/// mutably for the duration of a query. (A `&self` interning path keeps the type
-/// `Sync` and is a planned refinement.)
+/// The kernel is behind a `RefCell` because `query` is `&self` while MORK matching
+/// needs `&mut` access to the trie cursor; a query borrows mutably for its duration.
 pub struct MorkSpace {
     kernel: RefCell<MorkKernel>,
     common: SpaceCommon,
@@ -51,48 +54,54 @@ impl MorkSpace {
         self.len() == 0
     }
 
-    /// Bulk-loads atoms from an S-expression source (whitespace-separated atoms),
-    /// bypassing the per-atom `Atom` round-trip.
+    /// Bulk-loads atoms from an S-expression source (whitespace-separated atoms)
+    /// through MORK's parser. Convenient for large loads.
     pub fn add_sexpr_text(&mut self, text: &str) -> Result<usize, String> {
         self.kernel.get_mut().add_all_sexpr(text.as_bytes())
     }
 
-    /// The query core: encode `pattern` together with a variable-tuple template in
-    /// one parse (so the template references the pattern's variables), run MORK's
-    /// `dump_sexpr`, and decode each substituted tuple back into a `Bindings`.
-    fn run_query(&self, query: &Atom) -> BindingsSet {
+    fn query_inner(&self, query: &Atom) -> BindingsSet {
+        // Encode the pattern, tracking variables in introduction order so binding
+        // key (0, i) maps to the i-th variable.
         let mut vars: Vec<VariableAtom> = Vec::new();
-        collect_vars(query, &mut vars);
-
-        let var_str = vars
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        // `_p`/`_t` are throwaway wrapper heads; only children matter on decode.
-        let combined = format!("(_p {} (_t {}))", query, var_str);
-
-        let mut kernel = self.kernel.borrow_mut();
-        let mut buf = vec![0u8; combined.len() * 8 + 256];
-        let combined_expr = match kernel.parse_sexpr(combined.as_bytes(), buf.as_mut_ptr()) {
-            Ok((e, _len)) => e,
-            Err(_) => return BindingsSet::empty(),
-        };
-
-        let mut parts = Vec::new();
-        ExprEnv::new(0, combined_expr).args(&mut parts);
-        // parts = [_p, pattern, template]
-        if parts.len() < 3 {
+        let mut pat = Vec::new();
+        if encode_atom(query, &mut vars, &mut pat).is_err() {
             return BindingsSet::empty();
         }
-        let pattern = parts[1].subsexpr();
-        let template = parts[2].subsexpr();
+        // Wrap as the single-factor conjunction `(, <pattern>)` query_multi expects.
+        let mut wrapped = Vec::with_capacity(pat.len() + 3);
+        wrapped.push(item_byte(Tag::Arity(2)));
+        wrapped.push(item_byte(Tag::SymbolSize(1)));
+        wrapped.push(b',');
+        wrapped.extend_from_slice(&pat);
 
-        let mut out = Vec::new();
-        kernel.dump_sexpr(pattern, template, &mut out);
-        drop(kernel);
-
-        decode_result_tuples(&out, &vars)
+        let kernel = self.kernel.borrow();
+        let mut set = BindingsSet::empty();
+        let pat_expr = Expr {
+            ptr: wrapped.as_mut_ptr(),
+        };
+        MorkKernel::query_multi(&kernel.btm, pat_expr, |res, _loc| {
+            if let Ok(_) = res {
+                return true;
+            }
+            let Err(bindings) = res else { unreachable!() };
+            let mut acc = Some(Bindings::new());
+            for (i, var) in vars.iter().enumerate() {
+                let Some(env) = bindings.get(&(0u8, i as u8)) else {
+                    continue;
+                };
+                let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
+                let mut pos = 0usize;
+                if let Some(atom) = decode_atom(span, &mut pos) {
+                    acc = acc.and_then(|b| b.add_var_binding(var.clone(), atom).ok());
+                }
+            }
+            if let Some(b) = acc {
+                set.push(b);
+            }
+            true
+        });
+        set
     }
 }
 
@@ -102,117 +111,70 @@ impl Default for MorkSpace {
     }
 }
 
-/// Collects the distinct variables of `atom` in first-occurrence order.
-fn collect_vars(atom: &Atom, out: &mut Vec<VariableAtom>) {
+/// Walks a Hyperon `Atom` into MORK's preorder byte encoding, recording variables
+/// in first-occurrence order (`NewVar` introduces, later occurrences `VarRef` back).
+/// Errors when a symbol or arity exceeds MORK's 63 limit.
+fn encode_atom(atom: &Atom, vars: &mut Vec<VariableAtom>, out: &mut Vec<u8>) -> Result<(), ()> {
     match atom {
-        Atom::Variable(v) => {
-            if !out.contains(v) {
-                out.push(v.clone());
-            }
-        }
+        Atom::Symbol(s) => encode_symbol(s.name(), out),
+        Atom::Grounded(g) => encode_symbol(&g.to_string(), out),
         Atom::Expression(e) => {
-            for child in e.children() {
-                collect_vars(child, out);
+            let children = e.children();
+            if children.len() > MAX_FIELD {
+                return Err(());
             }
-        }
-        _ => {}
-    }
-}
-
-/// Decodes MORK's serialized output (one `(_t v1 v2 ...)` tuple per match) into a
-/// `BindingsSet`, pairing each tuple position with the query variable in `vars`.
-fn decode_result_tuples(out: &[u8], vars: &[VariableAtom]) -> BindingsSet {
-    let text = String::from_utf8_lossy(out);
-    let mut set = BindingsSet::empty();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(tuple) = parse_sexpr_atom(line) else {
-            continue;
-        };
-        let values: Vec<Atom> = match tuple {
-            Atom::Expression(e) => e.children().iter().skip(1).cloned().collect(),
-            _ => Vec::new(),
-        };
-        let mut acc = Some(Bindings::new());
-        for (var, value) in vars.iter().zip(values.iter()) {
-            acc = acc.and_then(|b| b.add_var_binding(var.clone(), value.clone()).ok());
-        }
-        if let Some(bindings) = acc {
-            set.push(bindings);
-        }
-    }
-    set
-}
-
-/// Minimal S-expression -> Atom decoder for MORK's symbolic output (symbols,
-/// `$variables`, and nested compounds). Does not handle quoted strings/escapes,
-/// which the v1 symbolic showcase does not produce.
-fn parse_sexpr_atom(s: &str) -> Option<Atom> {
-    let toks = tokenize(s);
-    let mut pos = 0;
-    let atom = parse_tokens(&toks, &mut pos)?;
-    Some(atom)
-}
-
-enum Tok {
-    Open,
-    Close,
-    Word(String),
-}
-
-fn tokenize(s: &str) -> Vec<Tok> {
-    let mut toks = Vec::new();
-    let mut cur = String::new();
-    let flush = |cur: &mut String, toks: &mut Vec<Tok>| {
-        if !cur.is_empty() {
-            toks.push(Tok::Word(std::mem::take(cur)));
-        }
-    };
-    for c in s.chars() {
-        match c {
-            '(' => {
-                flush(&mut cur, &mut toks);
-                toks.push(Tok::Open);
+            out.push(item_byte(Tag::Arity(children.len() as u8)));
+            for child in children {
+                encode_atom(child, vars, out)?;
             }
-            ')' => {
-                flush(&mut cur, &mut toks);
-                toks.push(Tok::Close);
-            }
-            c if c.is_whitespace() => flush(&mut cur, &mut toks),
-            _ => cur.push(c),
+            Ok(())
         }
-    }
-    flush(&mut cur, &mut toks);
-    toks
-}
-
-fn parse_tokens(toks: &[Tok], pos: &mut usize) -> Option<Atom> {
-    match toks.get(*pos)? {
-        Tok::Open => {
-            *pos += 1;
-            let mut children = Vec::new();
-            loop {
-                match toks.get(*pos)? {
-                    Tok::Close => {
-                        *pos += 1;
-                        break;
-                    }
-                    _ => children.push(parse_tokens(toks, pos)?),
+        Atom::Variable(v) => {
+            match vars.iter().position(|x| x == v) {
+                Some(i) if i <= MAX_FIELD => out.push(item_byte(Tag::VarRef(i as u8))),
+                Some(_) => return Err(()),
+                None => {
+                    out.push(item_byte(Tag::NewVar));
+                    vars.push(v.clone());
                 }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn encode_symbol(name: &str, out: &mut Vec<u8>) -> Result<(), ()> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_FIELD {
+        return Err(());
+    }
+    out.push(item_byte(Tag::SymbolSize(bytes.len() as u8)));
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Walks MORK's preorder byte encoding back into a Hyperon `Atom`. `pos` advances
+/// past the consumed bytes. Returns `None` on a malformed/short buffer.
+fn decode_atom(bytes: &[u8], pos: &mut usize) -> Option<Atom> {
+    let tag = byte_item(*bytes.get(*pos)?);
+    *pos += 1;
+    match tag {
+        Tag::SymbolSize(s) => {
+            let s = s as usize;
+            let end = pos.checked_add(s)?;
+            let name = std::str::from_utf8(bytes.get(*pos..end)?).ok()?;
+            *pos = end;
+            Some(Atom::sym(name))
+        }
+        Tag::Arity(k) => {
+            let mut children = Vec::with_capacity(k as usize);
+            for _ in 0..k {
+                children.push(decode_atom(bytes, pos)?);
             }
             Some(Atom::expr(children))
         }
-        Tok::Close => None,
-        Tok::Word(w) => {
-            *pos += 1;
-            Some(match w.strip_prefix('$') {
-                Some(name) => Atom::var(name),
-                None => Atom::sym(w.as_str()),
-            })
-        }
+        Tag::NewVar => Some(Atom::var("_")),
+        Tag::VarRef(i) => Some(Atom::var(format!("_{}", i))),
     }
 }
 
@@ -222,7 +184,7 @@ impl Space for MorkSpace {
     }
 
     fn query(&self, query: &Atom) -> BindingsSet {
-        self.run_query(query)
+        self.query_inner(query)
     }
 
     fn atom_count(&self) -> Option<usize> {
@@ -230,17 +192,13 @@ impl Space for MorkSpace {
     }
 
     fn visit(&self, v: &mut dyn SpaceVisitor) -> Result<(), ()> {
-        let mut out = Vec::new();
-        if self.kernel.borrow().dump_all_sexpr(&mut out).is_err() {
-            return Err(());
-        }
-        let text = String::from_utf8_lossy(&out);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(atom) = parse_sexpr_atom(line) {
+        use pathmap::zipper::{ZipperIteration, ZipperMoving};
+        let kernel = self.kernel.borrow();
+        let mut rz = kernel.btm.read_zipper();
+        while rz.to_next_val() {
+            let atom_bytes = rz.path();
+            let mut pos = 0;
+            if let Some(atom) = decode_atom(atom_bytes, &mut pos) {
                 v.accept(Cow::Owned(atom));
             }
         }
@@ -254,18 +212,20 @@ impl Space for MorkSpace {
 
 impl SpaceMut for MorkSpace {
     fn add(&mut self, atom: Atom) {
-        let _ = self.kernel.get_mut().add_all_sexpr(atom.to_string().as_bytes());
+        let mut vars = Vec::new();
+        let mut bytes = Vec::new();
+        if encode_atom(&atom, &mut vars, &mut bytes).is_ok() {
+            self.kernel.get_mut().btm.insert(&bytes, ());
+        }
     }
 
     fn remove(&mut self, atom: &Atom) -> bool {
-        match self
-            .kernel
-            .get_mut()
-            .remove_all_sexpr(atom.to_string().as_bytes())
-        {
-            Ok(n) => n > 0,
-            Err(_) => false,
+        let mut vars = Vec::new();
+        let mut bytes = Vec::new();
+        if encode_atom(atom, &mut vars, &mut bytes).is_err() {
+            return false;
         }
+        self.kernel.get_mut().btm.remove(&bytes).is_some()
     }
 
     fn replace(&mut self, from: &Atom, to: Atom) -> bool {
@@ -299,47 +259,74 @@ mod tests {
     use super::*;
     use hyperon_atom::Atom;
 
+    fn parent(a: &str, b: &str) -> Atom {
+        Atom::expr([Atom::sym("parent"), Atom::sym(a), Atom::sym(b)])
+    }
+
     #[test]
     fn add_and_count() {
         let mut space = MorkSpace::new();
         assert_eq!(space.atom_count(), Some(0));
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Tom"), Atom::sym("Bob")]));
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Bob"), Atom::sym("Ann")]));
+        space.add(parent("Tom", "Bob"));
+        space.add(parent("Bob", "Ann"));
         assert_eq!(space.atom_count(), Some(2));
+    }
+
+    #[test]
+    fn round_trip_nested_atom() {
+        let mut space = MorkSpace::new();
+        let a = Atom::expr([
+            Atom::sym("f"),
+            Atom::expr([Atom::sym("g"), Atom::sym("a")]),
+            Atom::sym("b"),
+        ]);
+        space.add(a.clone());
+        let q = Atom::var("x");
+        // (match $x) -- a bare variable matches every stored atom.
+        let results = space.query(&q);
+        let got: Vec<Atom> = results
+            .iter()
+            .filter_map(|b| b.resolve(&VariableAtom::new("x")))
+            .collect();
+        assert_eq!(got, vec![a]);
     }
 
     #[test]
     fn query_binds_one_variable() {
         let mut space = MorkSpace::new();
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Tom"), Atom::sym("Bob")]));
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Bob"), Atom::sym("Ann")]));
-
-        // (parent Tom $child)  ->  $child = Bob
+        space.add(parent("Tom", "Bob"));
+        space.add(parent("Bob", "Ann"));
         let q = Atom::expr([Atom::sym("parent"), Atom::sym("Tom"), Atom::var("child")]);
         let results = space.query(&q);
         assert_eq!(results.len(), 1);
-        let bound = results
-            .iter()
-            .next()
-            .unwrap()
-            .resolve(&VariableAtom::new("child"));
-        assert_eq!(bound, Some(Atom::sym("Bob")));
+        assert_eq!(
+            results.iter().next().unwrap().resolve(&VariableAtom::new("child")),
+            Some(Atom::sym("Bob"))
+        );
     }
 
     #[test]
     fn query_two_variables_multiple_results() {
         let mut space = MorkSpace::new();
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Tom"), Atom::sym("Bob")]));
-        space.add(Atom::expr([Atom::sym("parent"), Atom::sym("Bob"), Atom::sym("Ann")]));
-
+        space.add(parent("Tom", "Bob"));
+        space.add(parent("Bob", "Ann"));
         let q = Atom::expr([Atom::sym("parent"), Atom::var("p"), Atom::var("c")]);
         let results = space.query(&q);
         assert_eq!(results.len(), 2);
     }
 
     #[test]
+    fn remove_atom() {
+        let mut space = MorkSpace::new();
+        space.add(parent("Tom", "Bob"));
+        assert_eq!(space.len(), 1);
+        assert!(space.remove(&parent("Tom", "Bob")));
+        assert_eq!(space.len(), 0);
+        assert!(!space.remove(&parent("Tom", "Bob")));
+    }
+
+    #[test]
     fn bulk_load_scales_past_the_trie_crash() {
-        // hyperon #1076: GroundingSpace trie panics ~2k atoms on the first query.
         let mut space = MorkSpace::new();
         let mut text = String::new();
         for i in 0..20_000u32 {
@@ -347,10 +334,7 @@ mod tests {
         }
         space.add_sexpr_text(&text).unwrap();
         assert_eq!(space.atom_count(), Some(20_000));
-
-        // The first query after a large load is exactly what crashes the trie.
         let q = Atom::expr([Atom::sym("edge"), Atom::sym("n10000"), Atom::var("dst")]);
-        let results = space.query(&q);
-        assert_eq!(results.len(), 1);
+        assert_eq!(space.query(&q).len(), 1);
     }
 }
