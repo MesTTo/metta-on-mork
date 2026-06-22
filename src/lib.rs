@@ -13,6 +13,7 @@
 //! symbols are stored as raw bytes rather than interned tokens.)
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use hyperon_atom::matcher::{Bindings, BindingsSet};
 use hyperon_atom::{Atom, VariableAtom};
@@ -29,6 +30,59 @@ pub mod priority;
 /// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
 const MAX_FIELD: usize = 63;
 
+/// Reserved first byte of a grounded atom's symbol encoding. No real MeTTa symbol
+/// starts with NUL, so it cleanly separates a grounded `Atom` from a plain symbol in
+/// the trie. The bytes after it are the grounded atom's display string, the key into
+/// [`GroundedRegistry`].
+const GROUNDED_MARK: u8 = 0x00;
+
+/// Side table that makes grounded atoms round-trip losslessly through the byte trie.
+///
+/// MORK's encoding has no grounded type, so a Hyperon `Grounded` atom (a number, a
+/// bool, an arithmetic op like `<=`) is stored as a marker symbol carrying its
+/// display string, and the original `Atom` is kept here keyed by that string.
+/// `decode` rebuilds the exact grounded atom by cloning the canonical instance.
+/// Filled on `add`, read on `decode`; encoding is deterministic from the display
+/// string and needs no lookup, so query patterns encode to the same bytes as stored
+/// data without touching the table.
+///
+/// Identity is by display string: two grounded atoms that print the same are treated
+/// as equal (true for `Number`/`Bool`/`String`/op symbols). Snapshots and sharded
+/// shards carry no registry, so they decode grounded atoms as bare symbols.
+#[derive(Default, Clone)]
+struct GroundedRegistry {
+    by_display: HashMap<String, Atom>,
+}
+
+impl GroundedRegistry {
+    /// Records every grounded atom in `atom` (recursing into expressions) so it can
+    /// be reconstructed on decode. First instance per display string wins.
+    fn register(&mut self, atom: &Atom) {
+        match atom {
+            Atom::Grounded(g) => {
+                self.by_display.entry(g.to_string()).or_insert_with(|| atom.clone());
+            }
+            Atom::Expression(e) => {
+                for c in e.children() {
+                    self.register(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn get(&self, display: &str) -> Option<Atom> {
+        self.by_display.get(display).cloned()
+    }
+}
+
+/// Decode-time state: a running variable counter (so the i-th introduced variable and
+/// its back-references decode to the same name) and the optional grounded registry.
+struct DecodeCtx<'a> {
+    var_counter: usize,
+    grounded: Option<&'a GroundedRegistry>,
+}
+
 /// A Hyperon atomspace backed by the MORK kernel.
 ///
 /// The byte-level matcher (`query_multi`) takes the trie by shared reference, so
@@ -38,6 +92,7 @@ const MAX_FIELD: usize = 63;
 pub struct MorkSpace {
     kernel: MorkKernel,
     common: SpaceCommon,
+    grounded: GroundedRegistry,
 }
 
 impl MorkSpace {
@@ -46,6 +101,7 @@ impl MorkSpace {
         Self {
             kernel: MorkKernel::new(),
             common: SpaceCommon::default(),
+            grounded: GroundedRegistry::default(),
         }
     }
 
@@ -76,7 +132,7 @@ impl MorkSpace {
     }
 
     fn query_inner(&self, query: &Atom) -> BindingsSet {
-        query_btm(&self.kernel.btm, query)
+        query_btm(&self.kernel.btm, query, Some(&self.grounded))
     }
 
     /// A `Send + Sync` read-only snapshot for data-parallel querying: a cheap
@@ -92,10 +148,16 @@ impl MorkSpace {
 
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
-fn query_btm(btm: &PathMap<()>, query: &Atom) -> BindingsSet {
+fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
     let Some((mut wrapped, vars)) = wrap_pattern(query) else {
         return BindingsSet::empty();
     };
+    // Decode must recover grounded atoms that appear in the query itself (the `4` in
+    // `(= (sqr 4) $X)`), not only previously-stored ones, so a data-side binding like
+    // $x<-4 round-trips as the grounded Number rather than a bare symbol "4" that `*`
+    // cannot reduce. Merge the query's grounded atoms with the space registry here.
+    let mut reg = grounded.cloned().unwrap_or_default();
+    reg.register(query);
     let mut set = BindingsSet::empty();
     let pat_expr = Expr {
         ptr: wrapped.as_mut_ptr(),
@@ -103,14 +165,37 @@ fn query_btm(btm: &PathMap<()>, query: &Atom) -> BindingsSet {
     MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
         let Err(bindings) = res else { return true };
         let mut acc = Some(Bindings::new());
+        // One decode context per matched record. The shared variable counter advances
+        // across the bound subterms in query order, which is their left-to-right order
+        // in the matched atom, so a data variable shared across several subterms (e.g.
+        // $q in (-> (→ $p $q) (→ $q $r) (→ $p $r))) decodes to one consistent name.
+        let mut ctx = DecodeCtx { var_counter: 0, grounded: Some(&reg) };
         for (i, var) in vars.iter().enumerate() {
             let Some(env) = bindings.get(&(0u8, i as u8)) else {
                 continue;
             };
             let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
             let mut pos = 0usize;
-            if let Some(atom) = decode_atom(span, &mut pos) {
+            if let Some(atom) = decode_atom(span, &mut pos, &mut ctx) {
                 acc = acc.and_then(|b| b.add_var_binding(var.clone(), atom).ok());
+            }
+        }
+        // Data-side variable bindings: a variable that lives in a stored atom and got
+        // bound to a subterm of the query. Evaluating (sqr 4) against the stored rule
+        // (= (sqr $x) (* $x $x)) binds the data-side $x <- 4; the interpreter then
+        // resolves $X = (* $x $x) to (* 4 4). The query-var values above decode a data
+        // variable with index j as `vj` (VarRef(j) -> vj), so bind `vj` to its value
+        // here and Hyperon's transitive `resolve` performs the substitution.
+        for (&(ns, idx), env) in bindings.iter() {
+            if ns != 1 {
+                continue;
+            }
+            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
+            let mut pos = 0usize;
+            let mut dctx = DecodeCtx { var_counter: 0, grounded: Some(&reg) };
+            if let Some(atom) = decode_atom(span, &mut pos, &mut dctx) {
+                let name = VariableAtom::new(format!("v{}", idx));
+                acc = acc.and_then(|b| b.add_var_binding(name, atom).ok());
             }
         }
         if let Some(b) = acc {
@@ -131,7 +216,7 @@ pub struct MorkSnapshot {
 impl MorkSnapshot {
     /// Query the snapshot; safe to call concurrently from many threads.
     pub fn query(&self, query: &Atom) -> BindingsSet {
-        query_btm(&self.btm, query)
+        query_btm(&self.btm, query, None)
     }
 
     /// Number of atoms in the snapshot.
@@ -253,7 +338,7 @@ impl Default for MorkSpace {
 fn encode_atom(atom: &Atom, vars: &mut Vec<VariableAtom>, out: &mut Vec<u8>) -> Result<(), ()> {
     match atom {
         Atom::Symbol(s) => encode_symbol(s.name(), out),
-        Atom::Grounded(g) => encode_symbol(&g.to_string(), out),
+        Atom::Grounded(g) => encode_grounded(&g.to_string(), out),
         Atom::Expression(e) => {
             let children = e.children();
             if children.len() > MAX_FIELD {
@@ -289,28 +374,60 @@ fn encode_symbol(name: &str, out: &mut Vec<u8>) -> Result<(), ()> {
     Ok(())
 }
 
+/// Encodes a grounded atom as a marker symbol: [`GROUNDED_MARK`] followed by the
+/// atom's display string. `decode_atom` recognises the marker and rebuilds the
+/// original `Atom` from the [`GroundedRegistry`]. The display plus marker must fit
+/// MORK's 63-byte symbol field.
+fn encode_grounded(display: &str, out: &mut Vec<u8>) -> Result<(), ()> {
+    let bytes = display.as_bytes();
+    if bytes.is_empty() || bytes.len() + 1 > MAX_FIELD {
+        return Err(());
+    }
+    out.push(item_byte(Tag::SymbolSize((bytes.len() + 1) as u8)));
+    out.push(GROUNDED_MARK);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 /// Walks MORK's preorder byte encoding back into a Hyperon `Atom`. `pos` advances
 /// past the consumed bytes. Returns `None` on a malformed/short buffer.
-fn decode_atom(bytes: &[u8], pos: &mut usize) -> Option<Atom> {
+fn decode_atom(bytes: &[u8], pos: &mut usize, ctx: &mut DecodeCtx) -> Option<Atom> {
     let tag = byte_item(*bytes.get(*pos)?);
     *pos += 1;
     match tag {
         Tag::SymbolSize(s) => {
             let s = s as usize;
             let end = pos.checked_add(s)?;
-            let name = std::str::from_utf8(bytes.get(*pos..end)?).ok()?;
+            let raw = bytes.get(*pos..end)?;
             *pos = end;
+            if let Some((&GROUNDED_MARK, disp_bytes)) = raw.split_first() {
+                let disp = std::str::from_utf8(disp_bytes).ok()?;
+                // Rebuild the grounded atom from the registry; without one (snapshot or
+                // sharded shard) fall back to a bare symbol of the display string.
+                return Some(
+                    ctx.grounded
+                        .and_then(|reg| reg.get(disp))
+                        .unwrap_or_else(|| Atom::sym(disp)),
+                );
+            }
+            let name = std::str::from_utf8(raw).ok()?;
             Some(Atom::sym(name))
         }
         Tag::Arity(k) => {
             let mut children = Vec::with_capacity(k as usize);
             for _ in 0..k {
-                children.push(decode_atom(bytes, pos)?);
+                children.push(decode_atom(bytes, pos, ctx)?);
             }
             Some(Atom::expr(children))
         }
-        Tag::NewVar => Some(Atom::var("_")),
-        Tag::VarRef(i) => Some(Atom::var(format!("_{}", i))),
+        // The n-th introduced variable and its back-references share one name, so the
+        // coreference in stored atoms like (-> (→ $p $q) $p $q) survives the round-trip.
+        Tag::NewVar => {
+            let name = format!("v{}", ctx.var_counter);
+            ctx.var_counter += 1;
+            Some(Atom::var(name))
+        }
+        Tag::VarRef(i) => Some(Atom::var(format!("v{}", i))),
     }
 }
 
@@ -333,7 +450,11 @@ impl Space for MorkSpace {
         while rz.to_next_val() {
             let atom_bytes = rz.path();
             let mut pos = 0;
-            if let Some(atom) = decode_atom(atom_bytes, &mut pos) {
+            let mut ctx = DecodeCtx {
+                var_counter: 0,
+                grounded: Some(&self.grounded),
+            };
+            if let Some(atom) = decode_atom(atom_bytes, &mut pos, &mut ctx) {
                 v.accept(Cow::Owned(atom));
             }
         }
@@ -350,6 +471,7 @@ impl SpaceMut for MorkSpace {
         let mut vars = Vec::new();
         let mut bytes = Vec::new();
         if encode_atom(&atom, &mut vars, &mut bytes).is_ok() {
+            self.grounded.register(&atom);
             self.kernel.btm.insert(&bytes, ());
         }
     }
@@ -528,5 +650,32 @@ mod tests {
         zs.sort();
         zs.dedup();
         assert_eq!(zs, vec!["b", "c", "d"]); // transitive closure from a: b, c, d
+    }
+
+    /// hyperon-experimental #1079: GroundingSpace::visit undercounts atoms when many
+    /// share a head symbol (its reproducer enumerated 1293 of 1500). MORK walks every
+    /// trie leaf, so visit / get-atoms / atom_count are exact. Same reproducer workload.
+    #[test]
+    fn visit_counts_all_same_head_atoms() {
+        struct Counter(usize);
+        impl SpaceVisitor for Counter {
+            fn accept(&mut self, _: Cow<'_, Atom>) {
+                self.0 += 1;
+            }
+        }
+        let mut space = MorkSpace::new();
+        let target = 1500usize;
+        for n in 0..target {
+            space.add(Atom::expr([
+                Atom::sym("item-shape-signal"),
+                Atom::sym(format!("pattern-{n}")),
+                Atom::sym(format!("target-shape-{n}")),
+                Atom::sym(format!("{n}")),
+            ]));
+        }
+        assert_eq!(space.atom_count(), Some(target));
+        let mut counter = Counter(0);
+        space.visit(&mut counter).unwrap();
+        assert_eq!(counter.0, target, "MORK visit enumerated {} of {}", counter.0, target);
     }
 }
