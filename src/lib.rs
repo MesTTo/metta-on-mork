@@ -23,6 +23,7 @@ use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
 use mork::__mork_expr::{byte_item, item_byte, Expr, Tag};
 use mork::space::Space as MorkKernel;
+use mork::weighted_paths::{WeightedPathIndex, decode_pattern};
 use pathmap::PathMap;
 
 /// Priority ordering for evaluation control (Hyperon #448), grabbed from MeTTaTron.
@@ -180,6 +181,33 @@ impl MorkSpace {
     /// through MORK's parser. Convenient for large loads.
     pub fn add_sexpr_text(&mut self, text: &str) -> Result<usize, String> {
         self.kernel.add_all_sexpr(text.as_bytes())
+    }
+
+    /// WILLIAM (whitepaper 5.12): the term-boundary compression-gain index over the
+    /// stored atoms. Every whole-subexpression prefix shared by `count >= 2` atoms is
+    /// weighted `(count - 1) * len - count * ref_cost` (the bytes factoring it would
+    /// save); the index's top-k iterators surface the heaviest patterns without a
+    /// store scan. `mork::william::REF_COST` is the ref_cost matching the validated
+    /// factoring loop.
+    pub fn compression_gain_index(&self, ref_cost: u64) -> WeightedPathIndex {
+        WeightedPathIndex::from_compression_gain_on_boundaries(&self.kernel.btm, ref_cost)
+    }
+
+    /// The `k` heaviest non-overlapping compressible subpatterns, rendered as MeTTa
+    /// (argument slots the pattern cuts off show as `…`), heaviest first. One
+    /// representative per hot chain: a pattern nested inside a chosen heavier one is
+    /// suppressed, so the report reads as distinct structures rather than one chain's
+    /// prefixes.
+    pub fn frequent_subpatterns(&self, k: usize, ref_cost: u64) -> Vec<(String, u64)> {
+        self.compression_gain_index(ref_cost)
+            .iter_any_topk_maximal(k)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(pattern, gain)| (decode_pattern(&pattern), gain))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Runs MORK's MM2 exec engine -- the forward-chaining `(exec <loc> (, <src>)
@@ -784,6 +812,42 @@ mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::rc::Rc;
+
+    /// The WILLIAM report surfaces the shared rule spine as one readable maximal
+    /// pattern with the exact gain formula, and never returns nested prefixes of the
+    /// same chain.
+    #[test]
+    fn frequent_subpatterns_reports_maximal_readable_patterns() {
+        let mut space = MorkSpace::new();
+        for i in 0..40u32 {
+            space.add(Atom::expr([
+                Atom::sym("rule"),
+                Atom::expr([Atom::sym("when"), Atom::sym("gate")]),
+                Atom::sym(format!("a{i:02}")),
+            ]));
+        }
+        space.add(Atom::expr([Atom::sym("fact"), Atom::sym("solo")]));
+
+        let ref_cost = mork::william::REF_COST;
+        let report = space.frequent_subpatterns(4, ref_cost);
+        assert!(!report.is_empty());
+        let (rendered, gain) = &report[0];
+        assert_eq!(rendered, "(rule (when gate) …)");
+        // gain = (count-1)*len - count*ref_cost with count=40 and the spine's encoded
+        // length: arity byte + "rule" symbol (5) + arity byte + "when" symbol (5) +
+        // "gate" symbol (5) = 17 bytes.
+        assert_eq!(*gain, 39 * 17 - 40 * ref_cost);
+        // Maximal: no reported pattern renders as a prefix chain of another (each is a
+        // distinct structure).
+        for (i, (a, _)) in report.iter().enumerate() {
+            for (j, (b, _)) in report.iter().enumerate() {
+                if i != j {
+                    assert!(!a.trim_end_matches([')', '…', ' ']).is_empty());
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
 
     /// A prepared query encodes once and is reused across calls; it must give the same count
     /// as `count_matches`/`query` on every call (the kernel reads the pattern without mutating
