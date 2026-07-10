@@ -111,6 +111,27 @@ crate's differentials: variable-bearing stores stay on the enumerating path (a s
 `$x` unifies with any factor but is invisible to a prefix seek — pinned as a test), and a
 variable nested in a compound column declines (the documented #130 fragment).
 
+### Repeated queries replay in O(answers)
+
+The space tables the matcher's raw result rows per encoded pattern (an
+alpha-invariant key), invalidated by the mutation generation. A replay decodes
+the rows afresh — new variable ids per result, the mutable-grounded live filter
+re-applied — so it is indistinguishable from a live match, and it costs the
+answers, not the store. The worst-case shape is a variable-functor pattern
+`($x mid $y)`, which neither the trie descent nor the column index can take
+(`cargo run --release --example query_tabling`):
+
+| N | first call (scan + fill) | tabled replay | ratio |
+|---|---|---|---|
+| 100,000 | 3.12 ms | 1.68 µs | 1,855× |
+| 400,000 | 11.5 ms | 1.68 µs | 6,834× |
+| 1,600,000 | 45.7 ms | 1.99 µs | 22,981× |
+
+Unlike the byte-seek paths, tabling needs no var-freeness latch: the replayed
+rows are the unifier's own output, schematic data included. Conjunctive
+queries ride the same cache, so a repeated join replays without re-running the
+join. Caps: 256 shapes per space, 4,096 rows per shape.
+
 ## Against stock GroundingSpace
 
 Same workload (load N `(edge nK nK+1)` atoms, then a point query), measured back to back
@@ -221,6 +242,7 @@ query shape.
 - `examples/conjunctive_join.rs` — WCO join scaling and the #1076 reproduction.
 - `examples/arg_index.rs` — column-index scaling against the matcher scan.
 - `examples/factorized_count.rs` — factorized versus enumerating conjunctive counts.
+- `examples/query_tabling.rs` — tabled replay against the live scan.
 - `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
