@@ -399,6 +399,74 @@ impl MorkSpace {
         ))
     }
 
+    /// An O(1) copy-on-write fork: the trie shares structure with `self` until
+    /// either side mutates (PathMap node sharing), so branch-and-explore costs
+    /// nothing up front -- against the O(N) per-atom copy a space clone
+    /// otherwise costs. The fork carries the registry, the var-freeness latch,
+    /// and the current column indexes and tabled queries (all copy-on-write).
+    pub fn fork(&self) -> MorkSpace {
+        MorkSpace {
+            kernel: {
+                let mut k = MorkKernel::new();
+                k.btm = self.kernel.btm.clone();
+                k
+            },
+            common: SpaceCommon::default(),
+            grounded: self.grounded.clone(),
+            rejected_atoms: self.rejected_atoms,
+            column_index_cache: std::sync::RwLock::new(
+                self.column_index_cache.read().unwrap().clone(),
+            ),
+            mutation_gen: self.mutation_gen,
+            query_cache: std::sync::RwLock::new(self.query_cache.read().unwrap().clone()),
+            var_free: self.var_free,
+        }
+    }
+
+    /// Trie set algebra (PathMap `join`/`meet`/`subtract`): the operation runs
+    /// on the copy-on-write trie structure, sharing every common subtree with
+    /// both operands, instead of iterating atoms -- the CeTTa `mork:` algebra
+    /// surface, here as destination-mutating Space operations. Declines (returns
+    /// false, no change) when either space holds *mutable* grounded atoms:
+    /// their per-instance ids are space-local, so the other side's id bytes
+    /// would dangle in the merged trie. Immutable grounded atoms are
+    /// content-addressed and merge safely.
+    pub fn union_with(&mut self, other: &MorkSpace) -> bool {
+        self.algebra(other, |a, b| a.join(b))
+    }
+
+    /// Keeps exactly the atoms present in both spaces. See [`union_with`](Self::union_with).
+    pub fn intersect_with(&mut self, other: &MorkSpace) -> bool {
+        self.algebra(other, |a, b| a.meet(b))
+    }
+
+    /// Removes every atom present in `other`. See [`union_with`](Self::union_with).
+    pub fn subtract_space(&mut self, other: &MorkSpace) -> bool {
+        self.algebra(other, |a, b| a.subtract(b))
+    }
+
+    fn algebra(
+        &mut self,
+        other: &MorkSpace,
+        op: impl FnOnce(&PathMap<()>, &PathMap<()>) -> PathMap<()>,
+    ) -> bool {
+        if !self.grounded.by_id.is_empty() || !other.grounded.by_id.is_empty() {
+            return false;
+        }
+        self.kernel.btm = op(&self.kernel.btm, &other.kernel.btm);
+        // Adopt the other side's immutable grounded atoms so merged-in marker
+        // bytes decode (content-addressed: first instance per display wins).
+        for (display, atom) in other.grounded.by_display.iter() {
+            self.grounded
+                .by_display
+                .entry(display.clone())
+                .or_insert_with(|| atom.clone());
+        }
+        self.var_free = self.var_free && other.var_free;
+        self.mutation_gen += 1;
+        true
+    }
+
     /// A `Send + Sync` read-only snapshot for data-parallel querying: a cheap
     /// copy-on-write clone of the trie that many threads can query concurrently.
     /// MORK's `PathMap` is `Send + Sync`, so this is the parallel querying that
@@ -2103,6 +2171,83 @@ mod tests {
                 projected_results(&reference, &qv)
             );
         }
+    }
+
+    /// fork() is copy-on-write isolation: the fork answers like the original
+    /// until either side mutates, and mutations never leak across.
+    #[test]
+    fn fork_isolates_mutations_both_ways() {
+        let mut original = MorkSpace::new();
+        original.add(Atom::expr([Atom::sym("p"), Atom::sym("1")]));
+        let mut fork = original.fork();
+        let q = Atom::expr([Atom::sym("p"), Atom::var("x")]);
+        assert_eq!(fork.query(&q).len(), 1);
+        fork.add(Atom::expr([Atom::sym("p"), Atom::sym("2")]));
+        original.add(Atom::expr([Atom::sym("p"), Atom::sym("3")]));
+        assert_eq!(fork.query(&q).len(), 2);
+        assert_eq!(original.query(&q).len(), 2);
+        assert!(fork.query(&Atom::expr([Atom::sym("p"), Atom::sym("3")])).is_empty());
+        assert!(original.query(&Atom::expr([Atom::sym("p"), Atom::sym("2")])).is_empty());
+    }
+
+    /// The trie algebra must equal the per-atom set semantics on ground spaces,
+    /// and decline (leaving self untouched) when mutable grounded atoms exist.
+    proptest! {
+        #[test]
+        fn trie_algebra_matches_per_atom_set_semantics(
+            a in prop::collection::vec(arb_ground_atom(), 0..12),
+            b in prop::collection::vec(arb_ground_atom(), 0..12),
+        ) {
+            let vars = query_vars();
+            let build = |atoms: &[GenAtom]| {
+                let mut space = MorkSpace::new();
+                let mut set = BTreeSet::new();
+                for g in atoms {
+                    let atom = gen_atom_to_atom(g, &vars);
+                    set.insert(canonical_atom(&atom));
+                    space.add(atom);
+                }
+                (space, set)
+            };
+            let atoms_of = |space: &MorkSpace| {
+                let collected = RefCell::new(BTreeSet::new());
+                let mut visitor = |atom: Cow<Atom>| {
+                    collected.borrow_mut().insert(canonical_atom(&atom));
+                };
+                space.visit(&mut visitor).unwrap();
+                collected.into_inner()
+            };
+
+            let (a_space, a_set) = build(&a);
+            let (b_space, b_set) = build(&b);
+
+            let mut u = a_space.fork();
+            prop_assert!(u.union_with(&b_space));
+            prop_assert_eq!(atoms_of(&u), a_set.union(&b_set).cloned().collect::<BTreeSet<_>>());
+
+            let mut i = a_space.fork();
+            prop_assert!(i.intersect_with(&b_space));
+            prop_assert_eq!(atoms_of(&i), a_set.intersection(&b_set).cloned().collect::<BTreeSet<_>>());
+
+            let mut d = a_space.fork();
+            prop_assert!(d.subtract_space(&b_space));
+            prop_assert_eq!(atoms_of(&d), a_set.difference(&b_set).cloned().collect::<BTreeSet<_>>());
+        }
+    }
+
+    /// Mutable grounded atoms have space-local identity ids, so algebra with
+    /// them must decline rather than merge dangling id bytes.
+    #[test]
+    fn algebra_declines_mutable_grounded_stores() {
+        let mut a = MorkSpace::new();
+        a.add(Atom::expr([Atom::sym("cell"), Atom::gnd(MutCell::new(1))]));
+        let b = MorkSpace::new();
+        let before = a.atom_count();
+        assert!(!a.union_with(&b));
+        let mut c = MorkSpace::new();
+        c.add(Atom::sym("plain"));
+        assert!(!c.union_with(&a), "other side's mutable atoms must also decline");
+        assert_eq!(a.atom_count(), before);
     }
 
     /// Tabled replays must be indistinguishable from live matches: the same
