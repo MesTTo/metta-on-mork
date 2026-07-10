@@ -219,9 +219,14 @@ impl MorkSpace {
     /// Runs MORK's MM2 exec engine -- the forward-chaining `(exec <loc> (, <src>)
     /// (, <tpl>))` rules in the space -- for up to `steps` exec steps (each runs a
     /// rule to fixpoint), returning the steps taken. This is the *computation*
-    /// engine (CeTTa's `mork:step!`): the optimized kernel exec path that the six
-    /// benchmarks accelerate. Load facts and `exec` rules with `add`/`add_sexpr_text`
-    /// first, then `step`, then `query` the results.
+    /// engine (CeTTa's `mork:step!`). Load facts and `exec` rules with
+    /// `add`/`add_sexpr_text` first, then `step`, then `query` the results.
+    ///
+    /// Complexity opt-ins (cargo features, each byte-identical by the kernel's
+    /// differentials): `semi-naive` re-derives only each round's delta instead of
+    /// the whole space per round; `leapfrog` routes flat conjunctive rule bodies
+    /// through the worst-case-optimal leapfrog join; `factorized-aggregate` runs
+    /// COUNT/SUM/MIN/MAX/AND sinks without enumerating the join.
     pub fn step(&mut self, steps: usize) -> usize {
         self.kernel.metta_calculus(steps)
     }

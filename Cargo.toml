@@ -20,3 +20,9 @@ stateright = "0.31.0"
 
 [features]
 default = []
+# Kernel opt-ins, passed through to the MORK dependency. Each is byte-identical
+# to the default path by the kernel's own differentials; they change complexity,
+# not answers.
+semi-naive = ["mork/semi_naive_ic"]          # metta_calculus fixpoints match only the delta per round
+leapfrog = ["mork/leapfrog"]                 # flat conjunctive exec bodies route to the WCO leapfrog join
+factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exec sinks without enumerating the join
