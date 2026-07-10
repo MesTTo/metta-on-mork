@@ -25,7 +25,10 @@ main with the full set of 28 open MesTTo PRs merged** (branch `upstream-plus-prs
 [MesTTo/MORK](https://github.com/MesTTo/MORK) fork), on clean upstream
 [PathMap](https://github.com/Adam-Vandervorst/PathMap). Upstream-plus-PRs is the semantically
 accurate kernel; the deeper private-fork optimizations return here either as opt-in features
-or as bridge-level machinery in this crate.
+or as bridge-level machinery in this crate. The hyperon dependency
+(`../hyperon-experimental`) must be on its `send-sync-atoms` branch, which makes atoms and
+spaces thread-safe (`GroundedAtom: Send + Sync`, lock-based `Shared`/`SpaceCommon`/`DynSpace`)
+with hyperon's full workspace suite passing — the refactor upstream issue #410 asks for.
 
 The kernel's complexity opt-ins pass through as cargo features, each byte-identical to the
 default path by the kernel's own differential suites:
@@ -147,16 +150,24 @@ Load is 9–14× faster and a warm point query about 4×; a 1M-atom load lands i
 first query (a shape MORK has not seen) is ~30 µs against GroundingSpace's ~16 µs, both flat
 in N.
 
-## Parallel querying
+## Parallel querying, on one shared space
 
-A `MorkSnapshot` is `Send + Sync`, so read-only queries parallelize across threads
-(`cargo run --release --example parallel_query`): 3.7 µs/query at 1 thread improving to
-1.33 µs/query at 8 threads on this machine through the matcher, and ~730 ns flat for
-selective queries through the carried column indexes. Matcher-path scaling is sublinear
-because the upstream kernel keeps process-global matcher counters that all threads write; the
-private fork's per-thread accumulation is not yet in any upstream PR, and upstream's own
-issue #410 tracks the deeper Rc/RefCell refactor. The asymptotic levers above are unaffected —
-they change per-query complexity, not thread contention.
+`MorkSpace` itself is now `Send + Sync` (a compile-time assertion in the test suite): one
+live space object is shared by plain reference across threads — no snapshots, no clones.
+`cargo run --release --example shared_space_parallel` alternates trie-descent point queries
+and column-index seeks from every thread against the same space: 2.75 µs/query at 1 thread
+to 1.00 µs/query at 16 threads (320,000 queries, every result asserted). `MorkSnapshot`
+remains the frozen-view option (`--example parallel_query`), carrying the column indexes for
+~730 ns seeks. Matcher-path thread scaling is sublinear because the upstream kernel keeps
+process-global matcher counters that all threads write; the private fork's per-thread
+accumulation is not yet in any upstream PR.
+
+`fork()` is the copy-on-write branch-and-explore primitive: an O(1) clone of the whole space
+(trie, registry, indexes, tabled queries share structure until a side mutates) where a
+per-atom copy is O(N). `union_with`/`intersect_with`/`subtract_space` run PathMap's
+join/meet/subtract on the trie structure itself, sharing common subtrees with both operands
+instead of iterating atoms; they decline on stores holding mutable grounded atoms (space-local
+identity ids), and a proptest differential holds each equal to per-atom set semantics.
 
 ## WILLIAM, carried in-crate
 
@@ -217,10 +228,9 @@ query shape.
 
 ## Limitations
 
-- Full `MorkSpace` is not `Sync`. `query` is `&self`, but Hyperon's `SpaceCommon`, the MORK
-  and PathMap internals, the column-index cache, and grounded atoms carry non-`Sync` state.
-  Use `MorkSnapshot` for `Send + Sync` read-only parallel querying (snapshots carry no index
-  cache; they query through the matcher).
+- `MorkSpace` is `Send + Sync` on the `send-sync-atoms` hyperon branch; sharing it across
+  threads gives reader parallelism (`query` is `&self`). Mutation needs `&mut` or an outer
+  lock, as usual.
 - Grounded atom boundaries. Immutable grounded atoms are content-addressed by display string.
   Mutable grounded atoms such as `State` are stored by per-instance identity and matched by
   current live value. Snapshots and sharded spaces carry no grounded registry, so they are for
@@ -243,6 +253,7 @@ query shape.
 - `examples/arg_index.rs` — column-index scaling against the matcher scan.
 - `examples/factorized_count.rs` — factorized versus enumerating conjunctive counts.
 - `examples/query_tabling.rs` — tabled replay against the live scan.
+- `examples/shared_space_parallel.rs` — one `Send + Sync` space shared across threads.
 - `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
