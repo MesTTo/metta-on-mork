@@ -23,11 +23,16 @@ use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
 
 use mork::__mork_expr::{byte_item, item_byte, Expr, Tag};
 use mork::space::Space as MorkKernel;
-use mork::weighted_paths::{WeightedPathIndex, decode_pattern};
 use pathmap::PathMap;
+
+use crate::william::{decode_pattern, WeightedPathIndex};
 
 /// Priority ordering for evaluation control (Hyperon #448), grabbed from MeTTaTron.
 pub mod priority;
+
+/// WILLIAM's compression-gain index and pattern report, carried by this crate
+/// (the upstream kernel's weighted_paths sidecar stops at weight bookkeeping).
+pub mod william;
 
 /// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
 const MAX_FIELD: usize = 63;
@@ -186,9 +191,10 @@ impl MorkSpace {
     /// WILLIAM (whitepaper 5.12): the term-boundary compression-gain index over the
     /// stored atoms. Every whole-subexpression prefix shared by `count >= 2` atoms is
     /// weighted `(count - 1) * len - count * ref_cost` (the bytes factoring it would
-    /// save); the index's top-k iterators surface the heaviest patterns without a
-    /// store scan. `mork::william::REF_COST` is the ref_cost matching the validated
-    /// factoring loop.
+    /// save); the index's top-k iterator surfaces the heaviest patterns without a
+    /// store scan. `ref_cost` is the byte cost charged per reference to a factored
+    /// definition; the fork's validated factoring loop uses 9 (one `SymbolSize` tag
+    /// plus an 8-byte reference id payload).
     pub fn compression_gain_index(&self, ref_cost: u64) -> WeightedPathIndex {
         WeightedPathIndex::from_compression_gain_on_boundaries(&self.kernel.btm, ref_cost)
     }
@@ -828,7 +834,7 @@ mod tests {
         }
         space.add(Atom::expr([Atom::sym("fact"), Atom::sym("solo")]));
 
-        let ref_cost = mork::william::REF_COST;
+        let ref_cost = crate::william::REF_COST;
         let report = space.frequent_subpatterns(4, ref_cost);
         assert!(!report.is_empty());
         let (rendered, gain) = &report[0];

@@ -8,8 +8,8 @@ description = "MORK kernel as an in-process Hyperon atomspace backend (Space/Spa
 hyperon-atom = { path = "../hyperon-experimental/hyperon-atom" }
 hyperon-space = { path = "../hyperon-experimental/hyperon-space" }
 hyperon-common = { path = "../hyperon-experimental/hyperon-common" }
-mork = { path = "../mork-latest-linalg/kernel" }
-pathmap = { path = "../PathMap", features = ["jemalloc", "arena_compact", "nightly"] }
+mork = { path = "../mork-integration/MORK/kernel" }
+pathmap = { path = "../mork-integration/PathMap", features = ["jemalloc", "arena_compact", "nightly"] }
 rayon = "1"
 
 [dev-dependencies]
