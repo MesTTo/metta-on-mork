@@ -34,3 +34,7 @@ required-features = ["factorized-aggregate"]
 [[example]]
 name = "semi_naive_step"
 required-features = ["semi-naive"]
+
+[[example]]
+name = "process_calculus_step"
+required-features = ["semi-naive"]

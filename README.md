@@ -133,7 +133,44 @@ answers, not the store. The worst-case shape is a variable-functor pattern
 Unlike the byte-seek paths, tabling needs no var-freeness latch: the replayed
 rows are the unifier's own output, schematic data included. Conjunctive
 queries ride the same cache, so a repeated join replays without re-running the
-join. Caps: 256 shapes per space, 4,096 rows per shape.
+join. Memory stays proportional to queries that pay, not to query traffic: the
+auto-tabler admits a fill only when its measured matcher cost clears a
+threshold (50 µs release), so point lookups never occupy a cache entry, on top
+of the hard caps (256 shapes per space, 4,096 rows per shape) and generation
+invalidation — the same worth-gate / bounded-store / dirty-invalidation trio
+MeTTa TS's auto-tabler uses, with measured wall cost as the worth signal.
+
+### The compute lane: semi-naive fixpoints, measured on the kernel's own dish
+
+`step()` under the `semi-naive` feature on the kernel's `process_calculus`
+workload (Peano x+y by message passing, the dish where PR #128 counts 98.8% of
+naive match candidates as redundant), via
+`cargo run --release --features semi-naive --example process_calculus_step`:
+
+| workload | naive | semi-naive | ratio |
+|---|---|---|---|
+| 20+20, 100 steps | 54.1 ms | 6.60 ms | 8.2× |
+| 80+80, 400 steps | 2.38 s | 122 ms | 19.6× |
+| 200+200, 1000 steps | 35.9 s | 1.23 s | 29.1× |
+
+The ratio grows with size — the asymptotic signature — and the bridge is
+faithful: PR #128's own control table records 26.5× on the same shape. The
+private fork's further exec-arc work (streamed emit, plan freezing, fast
+paths) compounds beyond this; none of it is in an open PR yet.
+
+## MeTTa evaluation on the kernel
+
+`reduce(expr, fuel)` runs evaluation itself as MM2 exec rewriting inside an
+O(1) fork of the space: the expression seeds the dish, one dormant rewrite
+rule (`(mm2-ev $x)` meets `(= $x $y)`) is re-armed each round by the kernel
+benches' IC scheduler, and the fixpoint's equation-free terms come back — the
+MeTTa spec's `metta_call` fallback semantics on the outermost term-rewriting
+fragment. Accumulator-style recursion normalizes (`(add (S (S Z)) (S (S (S
+Z))))` → `(S (S (S (S (S Z)))))`), nondeterministic equations return every
+branch, and the live space never sees the scaffolding. Nested-redex programs
+need the congruence lowering — LeaTTa 1.0.8's `MorkMM2Lowering` is the
+mechanized spec for it, CeTTa's `mork:` lane the shipped reference — which is
+the named next step toward the full interpreter on the kernel.
 
 ## Against stock GroundingSpace
 
@@ -255,6 +292,7 @@ query shape.
 - `examples/query_tabling.rs` — tabled replay against the live scan.
 - `examples/shared_space_parallel.rs` — one `Send + Sync` space shared across threads.
 - `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
+- `examples/process_calculus_step.rs` — the kernel's process-calculus dish, naive versus semi-naive.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
 
