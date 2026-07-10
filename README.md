@@ -199,7 +199,11 @@ remains the frozen-view option (`--example parallel_query`), carrying the column
 process-global matcher counters that all threads write; the private fork's per-thread
 accumulation is not yet in any upstream PR.
 
-`fork()` is the copy-on-write branch-and-explore primitive: an O(1) clone of the whole space
+`extend_parallel(atoms, threads)` bulk-loads on PathMap's own architecture — per-thread
+private tries built without contention, merged by structural join (shared subtrees, no deep
+copies): 1M atoms in 20.3 ms at 16 threads against 289 ms for the sequential add loop
+(`cargo run --release --example parallel_load`), parity-sealed against sequential adds by
+proptest. `fork()` is the copy-on-write branch-and-explore primitive: an O(1) clone of the whole space
 (trie, registry, indexes, tabled queries share structure until a side mutates) where a
 per-atom copy is O(N). `union_with`/`intersect_with`/`subtract_space` run PathMap's
 join/meet/subtract on the trie structure itself, sharing common subtrees with both operands

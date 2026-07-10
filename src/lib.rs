@@ -85,6 +85,16 @@ fn is_mutable_grounded(atom: &Atom) -> bool {
     matches!(atom, Atom::Grounded(g) if g.as_grounded().is_mutable())
 }
 
+/// Whether `atom` holds a mutable grounded value anywhere in its tree: such
+/// atoms need the space's identity registry at encode time.
+fn contains_mutable_grounded(atom: &Atom) -> bool {
+    match atom {
+        Atom::Grounded(g) => g.as_grounded().is_mutable(),
+        Atom::Expression(e) => e.children().iter().any(contains_mutable_grounded),
+        _ => false,
+    }
+}
+
 /// Side table that makes grounded atoms round-trip losslessly through the byte trie.
 ///
 /// MORK's encoding has no grounded type, so a Hyperon `Grounded` atom is kept here and
@@ -418,6 +428,87 @@ impl MorkSpace {
         Some(indexed_facts_to_bindings(
             &facts, &classified, pos, &vars, &refs, self.grounded.clone(), query,
         ))
+    }
+
+    /// Bulk-loads atoms across threads, exploiting exactly the property the
+    /// wiki describes PathMap by: a prefix-partitioned trie of copy-on-write
+    /// nodes, so per-thread private tries merge by structural `join` (shared
+    /// subtrees, no deep copies) instead of contending on one writer. Atoms
+    /// are `Send + Sync` on the thread-safe base, so the slice shards by
+    /// reference. Atoms carrying *mutable* grounded values need the space's
+    /// identity registry and take the sequential path; everything else
+    /// encodes in parallel. Unencodable atoms count into
+    /// [`rejected_atom_count`](Self::rejected_atom_count) exactly as in
+    /// [`add`](SpaceMut::add).
+    pub fn extend_parallel(&mut self, atoms: &[Atom], threads: usize) {
+        let threads = threads.max(1);
+        let chunk = atoms.len().div_ceil(threads).max(1);
+
+        struct ShardOut {
+            trie: PathMap<()>,
+            registry: HashMap<String, Atom>,
+            rejected: usize,
+            var_free: bool,
+            mutable_grounded: Vec<usize>,
+        }
+
+        let shards: Vec<ShardOut> = std::thread::scope(|scope| {
+            let handles: Vec<_> = atoms
+                .chunks(chunk)
+                .enumerate()
+                .map(|(shard_idx, shard)| {
+                    scope.spawn(move || {
+                        let mut out = ShardOut {
+                            trie: PathMap::new(),
+                            registry: HashMap::new(),
+                            rejected: 0,
+                            var_free: true,
+                            mutable_grounded: Vec::new(),
+                        };
+                        let mut reg = GroundedRegistry::default();
+                        for (i, atom) in shard.iter().enumerate() {
+                            if contains_mutable_grounded(atom) {
+                                out.mutable_grounded.push(shard_idx * chunk + i);
+                                continue;
+                            }
+                            reg.register(atom);
+                            let mut vars = Vec::new();
+                            let mut bytes = Vec::new();
+                            if encode_atom(atom, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly)
+                                .is_err()
+                            {
+                                out.rejected += 1;
+                                continue;
+                            }
+                            if atom.iter().filter_type::<&VariableAtom>().next().is_some() {
+                                out.var_free = false;
+                            }
+                            out.trie.insert(&bytes, ());
+                        }
+                        out.registry = reg.by_display;
+                        out
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut sequential = Vec::new();
+        for shard in shards {
+            self.kernel.btm = self.kernel.btm.join(&shard.trie);
+            for (display, atom) in shard.registry {
+                self.grounded.by_display.entry(display).or_insert(atom);
+            }
+            self.rejected_atoms += shard.rejected;
+            self.var_free = self.var_free && shard.var_free;
+            sequential.extend(shard.mutable_grounded);
+        }
+        // Bulk load: one generation bump invalidates the indexes and the query
+        // table; they rebuild on next use.
+        self.mutation_gen += 1;
+        for idx in sequential {
+            self.add(atoms[idx].clone());
+        }
     }
 
     /// Evaluates a MeTTa expression against this space's `(= lhs rhs)`
@@ -1671,6 +1762,16 @@ mod tests {
         rows
     }
 
+    /// Every atom in the space, canonicalized, as a set (via visit).
+    fn space_atom_set(space: &MorkSpace) -> BTreeSet<String> {
+        let collected = RefCell::new(BTreeSet::new());
+        let mut visitor = |atom: Cow<Atom>| {
+            collected.borrow_mut().insert(canonical_atom(&atom));
+        };
+        space.visit(&mut visitor).unwrap();
+        collected.into_inner()
+    }
+
     fn insert_unique_atoms(atoms: &[GenAtom]) -> (GroundingSpace, MorkSpace) {
         let vars = query_vars();
         let mut seen = BTreeSet::new();
@@ -2354,6 +2455,47 @@ mod tests {
         assert_eq!(projected_results(&replay, &qv), projected_results(&fresh, &qv));
     }
 
+    /// Parallel bulk load must land exactly the atoms a sequential add loop
+    /// lands: same atom set, same rejection count, same latch.
+    proptest! {
+        #[test]
+        fn parallel_load_equals_sequential(
+            atoms in prop::collection::vec(arb_atom(), 0..24),
+        ) {
+            let vars = query_vars();
+            let atoms: Vec<Atom> = atoms.iter().map(|a| gen_atom_to_atom(a, &vars)).collect();
+            let mut seq = MorkSpace::new();
+            for a in &atoms {
+                seq.add(a.clone());
+            }
+            let mut par = MorkSpace::new();
+            par.extend_parallel(&atoms, 4);
+            prop_assert_eq!(space_atom_set(&par), space_atom_set(&seq));
+            prop_assert_eq!(par.rejected_atom_count(), seq.rejected_atom_count());
+            prop_assert_eq!(par.var_free, seq.var_free);
+        }
+    }
+
+    /// Mutable grounded atoms take the sequential fallback inside the parallel
+    /// load and keep their identity semantics.
+    #[test]
+    fn parallel_load_handles_mutable_grounded() {
+        let cell = MutCell::new(3);
+        let atoms = vec![
+            Atom::expr([Atom::sym("box"), Atom::gnd(cell.clone())]),
+            Atom::expr([Atom::sym("plain"), Atom::sym("x")]),
+        ];
+        let mut space = MorkSpace::new();
+        space.extend_parallel(&atoms, 2);
+        cell.set(9);
+        let q = Atom::expr([Atom::sym("box"), Atom::var("v")]);
+        assert_eq!(
+            resolve(space.query(&q).iter().next().unwrap(), "v"),
+            Some(Atom::gnd(MutCell::new(9))),
+            "live value must be visible through the registry"
+        );
+    }
+
     /// fork() is copy-on-write isolation: the fork answers like the original
     /// until either side mutates, and mutations never leak across.
     #[test]
@@ -2390,14 +2532,7 @@ mod tests {
                 }
                 (space, set)
             };
-            let atoms_of = |space: &MorkSpace| {
-                let collected = RefCell::new(BTreeSet::new());
-                let mut visitor = |atom: Cow<Atom>| {
-                    collected.borrow_mut().insert(canonical_atom(&atom));
-                };
-                space.visit(&mut visitor).unwrap();
-                collected.into_inner()
-            };
+            let atoms_of = space_atom_set;
 
             let (a_space, a_set) = build(&a);
             let (b_space, b_set) = build(&b);
