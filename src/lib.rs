@@ -42,6 +42,12 @@ pub mod argindex;
 /// MORK's 6-bit `SymbolSize`/`Arity` fields cap symbol length and arity at 63.
 const MAX_FIELD: usize = 63;
 
+/// Tabling caps: at most this many distinct query shapes stay cached per space
+/// (insertion-capped; a stale entry re-fills in place past the cap)...
+const QUERY_CACHE_MAX_ENTRIES: usize = 256;
+/// ...and a result set larger than this skips the cache, bounding memory.
+const QUERY_CACHE_MAX_ROWS: usize = 4096;
+
 /// Reserved first byte of a grounded atom's symbol encoding. No real MeTTa symbol
 /// starts with NUL, so it cleanly separates a grounded `Atom` from a plain symbol in
 /// the trie. The bytes after it are the grounded atom's display string, the key into
@@ -164,8 +170,15 @@ pub struct MorkSpace {
     /// `Sync`, so the RefCell is uncontended.
     column_index_cache: RefCell<HashMap<(Vec<u8>, usize, usize), (PathMap<()>, u64)>>,
     /// Bumped by every mutation (`add`, `remove`, `add_sexpr_text`, `step`):
-    /// the O(1) staleness authority for the column indexes.
+    /// the O(1) staleness authority for the column indexes and the query cache.
     mutation_gen: u64,
+    /// Tabled queries: the kernel matcher's raw rows per encoded pattern, keyed
+    /// by the `(, ...)` pattern bytes (alpha-invariant by construction) and the
+    /// mutation generation they were captured at. A hit replays rows through
+    /// [`rows_to_bindings`], whose per-row fresh ids and live mutable-grounded
+    /// filter make a replay indistinguishable from a live match; a repeated
+    /// scan-class query is O(answers) instead of O(N) from the second call on.
+    query_cache: RefCell<HashMap<Vec<u8>, (Vec<RawRow>, u64)>>,
     /// One-way latch: true while every stored atom is variable-free. Byte-level
     /// fast paths (the factorized conjunctive count) match by trie prefix and
     /// cannot see a stored variable unifying with a pattern position (a bare
@@ -187,6 +200,7 @@ impl MorkSpace {
             rejected_atoms: 0,
             column_index_cache: RefCell::new(HashMap::new()),
             mutation_gen: 0,
+            query_cache: RefCell::new(HashMap::new()),
             var_free: true,
         }
     }
@@ -272,7 +286,36 @@ impl MorkSpace {
                 return set;
             }
         }
-        query_btm(&self.kernel.btm, query, Some(&self.grounded))
+        // The empty conjunction `(,)` is a fold over zero sub-queries.
+        if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+            return BindingsSet::single();
+        }
+        let Some((wrapped, vars, refs)) = wrap_pattern(query) else {
+            return BindingsSet::empty();
+        };
+        let mut reg = self.grounded.clone();
+        reg.register(query);
+        // Tabling: replay this pattern's raw rows while the space is unchanged.
+        // Decode runs per hit (fresh result ids) and the mutable-grounded live
+        // filter reruns inside rows_to_bindings, so a replayed answer is
+        // indistinguishable from a live match.
+        let gen = self.mutation_gen;
+        {
+            let cache = self.query_cache.borrow();
+            if let Some((rows, g)) = cache.get(&wrapped) {
+                if *g == gen {
+                    return rows_to_bindings(rows, &vars, &refs, &reg);
+                }
+            }
+        }
+        let rows = query_btm_rows(&self.kernel.btm, &wrapped);
+        if rows.len() <= QUERY_CACHE_MAX_ROWS {
+            let mut cache = self.query_cache.borrow_mut();
+            if cache.len() < QUERY_CACHE_MAX_ENTRIES || cache.contains_key(&wrapped) {
+                cache.insert(wrapped, (rows.clone(), gen));
+            }
+        }
+        rows_to_bindings(&rows, &vars, &refs, &reg)
     }
 
     /// Incrementally maintains the fresh column indexes across one mutation:
@@ -524,74 +567,108 @@ fn indexed_facts_to_bindings(
     set
 }
 
-/// The byte-level query against a bare trie, shared by `MorkSpace` and the
-/// `Send + Sync` `MorkSnapshot`.
-fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
-    // The empty conjunction `(,)` is a fold over zero sub-queries: one empty binding.
-    if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
-        return BindingsSet::single();
-    }
-    let Some((mut wrapped, vars, refs)) = wrap_pattern(query) else {
-        return BindingsSet::empty();
-    };
-    // Decode must recover grounded atoms that appear in the query itself (the `4` in
-    // `(= (sqr 4) $X)`), not only previously-stored ones, so a data-side binding like
-    // $x<-4 round-trips as the grounded Number rather than a bare symbol "4" that `*`
-    // cannot reduce. Merge the query's grounded atoms with the space registry here.
-    let mut reg = grounded.cloned().unwrap_or_default();
-    reg.register(query);
-    let mut set = BindingsSet::empty();
+/// One binding of one raw match, exactly as the kernel callback saw it: the
+/// `(ns, idx)` key, the captured sub-expression's bytes (copied out of the
+/// traversal), and the span's owning namespace `env.n` plus NewVar seed `env.v`.
+/// Rows replay through [`rows_to_bindings`], which re-decodes with fresh result
+/// ids, so a replayed row is indistinguishable from a live match.
+#[derive(Clone)]
+struct RawBinding {
+    key_ns: u8,
+    key_idx: u8,
+    span: Vec<u8>,
+    env_n: u8,
+    env_v: u8,
+}
+
+/// One raw match: the kernel unifier's bindings in `BTreeMap` iteration order.
+#[derive(Clone)]
+struct RawRow {
+    entries: Vec<RawBinding>,
+}
+
+/// Runs the kernel matcher and captures every match as a [`RawRow`]. `wrapped`
+/// is the `(, ...)`-encoded pattern; the kernel reads it without mutating it
+/// (the prepared-query contract).
+fn query_btm_rows(btm: &PathMap<()>, wrapped: &[u8]) -> Vec<RawRow> {
     let pat_expr = Expr {
-        ptr: wrapped.as_mut_ptr(),
+        ptr: wrapped.as_ptr() as *mut u8,
     };
+    let mut rows = Vec::new();
     MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
         let Err(bindings) = res else { return true };
+        rows.push(RawRow {
+            entries: bindings
+                .iter()
+                .map(|(&(key_ns, key_idx), env)| RawBinding {
+                    key_ns,
+                    key_idx,
+                    span: unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec(),
+                    env_n: env.n,
+                    env_v: env.v,
+                })
+                .collect(),
+        });
+        true
+    });
+    rows
+}
+
+/// Decodes raw matcher rows into the caller's `BindingsSet`. Every row gets one
+/// fresh id: every data variable decoded below shares it, so the result is
+/// internally coreferent by name yet globally distinct from every other result
+/// and query call -- replayed rows included. Without this, a data var `v1_0`
+/// from one match aliased a `v1_0` from a deeper recursion's match, and the
+/// interpreter's threaded bindings collapsed the branch to empty (b2
+/// backchaining: mortal<-human<-And).
+fn rows_to_bindings(
+    rows: &[RawRow],
+    vars: &[VariableAtom],
+    refs: &[(usize, Atom)],
+    reg: &GroundedRegistry,
+) -> BindingsSet {
+    let mut set = BindingsSet::empty();
+    for row in rows {
         let mut acc = BindingsSet::single();
-        // One fresh id for this whole result: every data variable decoded below shares it,
-        // so the result is internally coreferent by name yet globally distinct from every
-        // other result and query call. Without this, a data var `v1_0` from one match
-        // aliased a `v1_0` from a deeper recursion's match, and the interpreter's threaded
-        // bindings collapsed the branch to empty (b2 backchaining: mortal<-human<-And).
         let result_id = next_variable_id();
-        // Iterate every binding the unifier produced. The key (ns, idx) names a variable
-        // by its namespace -- 0 is the query pattern, >=1 a matched data atom / factor --
-        // and its index; the bound value's own variables live in the value's namespace
-        // `env.n`. Decode names a variable `v{ns}_{idx}`, so a data variable and a pattern
-        // variable can never collide. (Without this, evaluating (Add (S $n) Z) bound the
-        // data variable $x to the compound (S $n); both decoded to `v0`, yielding the
-        // spurious occurs-failing binding `v0 <- (S v0)` that dropped the whole result and
-        // stalled b1_equal_chain.) Query variables (ns 0) bind their real names so the
-        // result is in terms the caller asked for; data/factor variables bind `v{ns}_{idx}`
-        // for Hyperon's transitive `resolve` to chase.
-        for (&(key_ns, key_idx), env) in bindings.iter() {
-            let span = unsafe { env.subsexpr().span().as_ref().unwrap() };
+        // The key (ns, idx) names a variable by its namespace -- 0 is the query
+        // pattern, >=1 a matched data atom / factor -- and its index; the bound
+        // value's own variables live in the value's namespace `env.n`. Decode
+        // names a variable `v{ns}_{idx}`, so a data variable and a pattern
+        // variable can never collide. (Without this, evaluating (Add (S $n) Z)
+        // bound the data variable $x to the compound (S $n); both decoded to
+        // `v0`, yielding the spurious occurs-failing binding `v0 <- (S v0)` that
+        // dropped the whole result and stalled b1_equal_chain.) Query variables
+        // (ns 0) bind their real names so the result is in terms the caller
+        // asked for; data/factor variables bind `v{ns}_{idx}` for Hyperon's
+        // transitive `resolve` to chase.
+        for b in &row.entries {
             let mut pos = 0usize;
-            // Seed the NewVar counter with `env.v`: the count of NewVars preceding this
-            // span in its base atom (maintained by ExprEnv::args). A captured sub-span is
-            // carved from the middle of an atom, so its `VarRef(i)` bytes index variables
-            // in the atom's *global* scope, and a `NewVar` inside it is the (env.v)-th
-            // variable of that scope, not the 0th. Decoding from 0 gave a binder var a
-            // local index that collided with an outer VarRef (e.g. (part-appl $f $x) ->
-            // (lambda $y ($f $x $y)) decoded the binder $y as v1_0 == $f, so $y absorbed
-            // $f's value `+`). Seeding from env.v aligns NewVar names with VarRef names,
-            // so a variable's binder and body occurrences share one name (consistent VBTO).
+            // Seed the NewVar counter with `env.v`: the count of NewVars
+            // preceding this span in its base atom (maintained by
+            // ExprEnv::args). A captured sub-span is carved from the middle of
+            // an atom, so its `VarRef(i)` bytes index variables in the atom's
+            // *global* scope, and a `NewVar` inside it is the (env.v)-th
+            // variable of that scope, not the 0th. Seeding from env.v aligns
+            // NewVar names with VarRef names, so a variable's binder and body
+            // occurrences share one name (consistent VBTO).
             let mut ctx = DecodeCtx {
-                var_counter: env.v as usize,
-                grounded: Some(&reg),
-                ns: env.n,
-                query_vars: &vars,
+                var_counter: b.env_v as usize,
+                grounded: Some(reg),
+                ns: b.env_n,
+                query_vars: vars,
                 result_id,
             };
-            let Some(atom) = decode_atom(span, &mut pos, &mut ctx) else {
+            let Some(atom) = decode_atom(&b.span, &mut pos, &mut ctx) else {
                 continue;
             };
-            let var = if key_ns == 0 {
-                match vars.get(key_idx as usize) {
+            let var = if b.key_ns == 0 {
+                match vars.get(b.key_idx as usize) {
                     Some(v) => v.clone(),
                     None => continue,
                 }
             } else {
-                VariableAtom::new_id(format!("v{}_{}", key_ns, key_idx), result_id)
+                VariableAtom::new_id(format!("v{}_{}", b.key_ns, b.key_idx), result_id)
             };
             acc = bind_or_equate(acc, var, atom);
             if acc.is_empty() {
@@ -600,10 +677,29 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
         }
         // e3: `&state-active` matches the goal whose cell currently holds that
         // value, not one mutated since it was stored.
-        set.extend(apply_live_refs(acc, &refs, &vars));
-        true
-    });
+        set.extend(apply_live_refs(acc, refs, vars));
+    }
     set
+}
+
+/// The byte-level query against a bare trie, shared by `MorkSpace` and the
+/// `Send + Sync` `MorkSnapshot`.
+fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
+    // The empty conjunction `(,)` is a fold over zero sub-queries: one empty binding.
+    if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+        return BindingsSet::single();
+    }
+    let Some((wrapped, vars, refs)) = wrap_pattern(query) else {
+        return BindingsSet::empty();
+    };
+    // Decode must recover grounded atoms that appear in the query itself (the `4` in
+    // `(= (sqr 4) $X)`), not only previously-stored ones, so a data-side binding like
+    // $x<-4 round-trips as the grounded Number rather than a bare symbol "4" that `*`
+    // cannot reduce. Merge the query's grounded atoms with the space registry here.
+    let mut reg = grounded.cloned().unwrap_or_default();
+    reg.register(query);
+    let rows = query_btm_rows(btm, &wrapped);
+    rows_to_bindings(&rows, &vars, &refs, &reg)
 }
 
 /// A `Send + Sync` read-only snapshot of a space's atoms (a copy-on-write clone of
@@ -1986,6 +2082,51 @@ mod tests {
             prop_assert_eq!(
                 projected_results(&routed, &qv),
                 projected_results(&reference, &qv)
+            );
+        }
+    }
+
+    /// Tabled replays must be indistinguishable from live matches: the same
+    /// query repeated (replay path), and repeated again after a mutation
+    /// (invalidation), each equal a fresh matcher run -- over stores that may
+    /// hold variables (the cache does not need the var-freeness latch).
+    proptest! {
+        #[test]
+        fn tabled_queries_replay_exactly(
+            atoms in prop::collection::vec(arb_atom(), 0..14),
+            extra in arb_ground_atom(),
+            query in arb_atom(),
+        ) {
+            let vars = query_vars();
+            let query = gen_atom_to_atom(&query, &vars);
+            let qv = query_variables(&query);
+            let mut mork = MorkSpace::new();
+            let mut reg = GroundedRegistry::default();
+            for a in &atoms {
+                let a = gen_atom_to_atom(a, &vars);
+                reg.register(&a);
+                mork.add(a);
+            }
+            let fresh = |m: &MorkSpace, r: &GroundedRegistry| {
+                query_btm(&m.kernel.btm, &query, Some(r))
+            };
+            let first = mork.query(&query);
+            let replay = mork.query(&query);
+            prop_assert_eq!(
+                projected_results(&replay, &qv),
+                projected_results(&fresh(&mork, &reg), &qv)
+            );
+            prop_assert_eq!(
+                projected_results(&first, &qv),
+                projected_results(&replay, &qv)
+            );
+            let extra = gen_atom_to_atom(&extra, &vars);
+            reg.register(&extra);
+            mork.add(extra);
+            let after = mork.query(&query);
+            prop_assert_eq!(
+                projected_results(&after, &qv),
+                projected_results(&fresh(&mork, &reg), &qv)
             );
         }
     }
