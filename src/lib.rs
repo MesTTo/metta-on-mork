@@ -420,6 +420,77 @@ impl MorkSpace {
         ))
     }
 
+    /// Evaluates a MeTTa expression against this space's `(= lhs rhs)`
+    /// equations by running the evaluation AS MM2 exec rewriting inside the
+    /// kernel -- the first step of MeTTa-on-MORK evaluation, not just
+    /// MeTTa-storage-on-MORK. The semantics implemented is the outermost
+    /// term-rewriting fragment of the spec's `metta_call`: a term some
+    /// equation matches rewrites to every matching body (all branches kept,
+    /// MeTTa's nondeterminism); a term no equation matches returns itself.
+    /// This covers accumulator/state-machine style programs (each body's root
+    /// is the next redex or a constructor); nested-redex programs need the
+    /// congruence lowering (LeaTTa's MorkMM2Lowering models it; CeTTa's
+    /// mork: lane ships it) -- future work.
+    ///
+    /// Runs inside an O(1) [`fork`](Self::fork), so the live space never sees
+    /// the evaluation scaffolding; `max_steps` bounds the exec loop (fuel).
+    /// With the `semi-naive` feature the fixpoint matches only each round's
+    /// delta.
+    pub fn reduce(&self, expr: &Atom, max_steps: usize) -> Vec<Atom> {
+        let mut scratch = self.fork();
+        // Seed the query term; the rewrite rule is a dormant ((exec 0) ...)
+        // re-armed each round by the kernel benches' IC scheduler (an exec is
+        // consumed when it fires, so multi-round rewriting needs the meta-rule;
+        // this is the exact scaffold the semi-naive example validates). The
+        // seed symbol is namespaced to stay clear of program atoms; max_steps
+        // is the Peano fuel of the scheduler, one unit per rewrite round.
+        let seed = Atom::expr([Atom::sym("mm2-ev"), expr.clone()]);
+        scratch.add(seed);
+        let mut fuel = String::with_capacity(max_steps * 3 + 1);
+        for _ in 0..max_steps {
+            fuel.push_str("(S ");
+        }
+        fuel.push('Z');
+        for _ in 0..max_steps {
+            fuel.push(')');
+        }
+        let program = format!(
+            r#"
+(exec (IC 0 0 {fuel})
+               (, (exec (IC $x $y (S $c)) $sp $st)
+                  ((exec $x) $p $t))
+               (, (exec (IC $y $x $c) $sp $st)
+                  (exec (R $x) $p $t)))
+((exec 0) (, (mm2-ev $x) (= $x $y)) (, (mm2-ev $y)))
+"#
+        );
+        if scratch.add_sexpr_text(&program).is_err() {
+            return Vec::new();
+        }
+        scratch.step(usize::MAX / 2);
+
+        // Every (mm2-ev <t>) in the dish is a term the rewrite reached; the
+        // results are the irreducible ones (no equation matches them), which
+        // is exactly metta_call's no-match self-return.
+        let reached = scratch.query(&Atom::expr([Atom::sym("mm2-ev"), Atom::var("t")]));
+        let t_var = VariableAtom::new("t");
+        let mut results = Vec::new();
+        for b in reached.iter() {
+            let Some(term) = b.resolve(&t_var) else {
+                continue;
+            };
+            let redex_probe = Atom::expr([
+                Atom::sym("="),
+                term.clone(),
+                Atom::var("mm2_reduct"),
+            ]);
+            if scratch.query(&redex_probe).is_empty() {
+                results.push(term);
+            }
+        }
+        results
+    }
+
     /// An O(1) copy-on-write fork: the trie shares structure with `self` until
     /// either side mutates (PathMap node sharing), so branch-and-explore costs
     /// nothing up front -- against the O(N) per-atom copy a space clone
@@ -2192,6 +2263,57 @@ mod tests {
                 projected_results(&reference, &qv)
             );
         }
+    }
+
+    /// reduce() runs evaluation as MM2 rewriting: accumulator-style recursion
+    /// reaches its normal form, nondeterministic equations return every
+    /// branch, an equation-free term self-returns, and the live space never
+    /// sees the scaffolding.
+    #[test]
+    fn reduce_runs_metta_rewriting_on_the_kernel() {
+        let mut space = MorkSpace::new();
+        space
+            .add_sexpr_text("(= (add Z $y) $y)
+(= (add (S $x) $y) (add $x (S $y)))
+")
+            .unwrap();
+
+        let two_plus_three = Atom::expr([
+            Atom::sym("add"),
+            peano_test_atom(2),
+            peano_test_atom(3),
+        ]);
+        let results = space.reduce(&two_plus_three, 50);
+        assert_eq!(results, vec![peano_test_atom(5)], "2+3 must normalize to 5");
+
+        // Nondeterminism: both coin branches come back.
+        space.add_sexpr_text("(= (coin) heads)
+(= (coin) tails)
+").unwrap();
+        let mut coins = space
+            .reduce(&Atom::expr([Atom::sym("coin")]), 10)
+            .iter()
+            .map(canonical_atom)
+            .collect::<Vec<_>>();
+        coins.sort();
+        assert_eq!(coins, vec!["S(heads)".to_string(), "S(tails)".to_string()]);
+
+        // No equation matches: the term self-returns.
+        let inert = Atom::expr([Atom::sym("opaque"), Atom::sym("thing")]);
+        assert_eq!(space.reduce(&inert, 10), vec![inert.clone()]);
+
+        // The live space holds only the program: no mm2-ev, no exec leftovers.
+        assert!(space
+            .query(&Atom::expr([Atom::sym("mm2-ev"), Atom::var("t")]))
+            .is_empty());
+    }
+
+    fn peano_test_atom(n: usize) -> Atom {
+        let mut a = Atom::sym("Z");
+        for _ in 0..n {
+            a = Atom::expr([Atom::sym("S"), a]);
+        }
+        a
     }
 
     /// The auto-tabler admits by measured cost: a cheap query on a small store
