@@ -287,7 +287,8 @@ query shape.
 ## Layout
 
 - `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the byte-level codec, conjunctive
-  encoding, the factorized count, and the differential test suite.
+  encoding, the factorized count, direct `transform`, prefix restriction, paths persistence,
+  `reduce`, `fork`, the trie algebra, parallel loading, and the differential test suite.
 - `src/argindex.rs` — the argument-position (column) index: build, seek, classify.
 - `src/william.rs` — the WILLIAM compression-gain index and pattern report.
 - `examples/conjunctive_join.rs` — WCO join scaling and the #1076 reproduction.
