@@ -30,9 +30,12 @@ or as bridge-level machinery in this crate.
 The kernel's complexity opt-ins pass through as cargo features, each byte-identical to the
 default path by the kernel's own differential suites:
 
-- `semi-naive` — `metta_calculus` fixpoints match only each round's delta (PR #128 measures
-  98.8% of naive match candidates as redundant re-derivation on `process_calculus`:
-  201,401 unifications naive against 2,377 semi-naive).
+- `semi-naive` — `metta_calculus` fixpoints match only each round's delta. Measured here on a
+  chain transitive closure (`cargo run --release --features semi-naive --example
+  semi_naive_step`): 3–6× (104.7 s naive → 30.1 s at N=800), bounded on that shape by its
+  quadratic output, which both paths must insert; PR #128's own workload shows the redundancy
+  the delta removes (98.8% of naive match candidates on `process_calculus`, 201,401
+  unifications naive against 2,377).
 - `leapfrog` — flat conjunctive exec bodies route through the worst-case-optimal
   leapfrog-unification join (PR #124).
 - `factorized-aggregate` — COUNT/SUM/MIN/MAX/AND exec sinks fold the join instead of
@@ -218,6 +221,7 @@ query shape.
 - `examples/conjunctive_join.rs` — WCO join scaling and the #1076 reproduction.
 - `examples/arg_index.rs` — column-index scaling against the matcher scan.
 - `examples/factorized_count.rs` — factorized versus enumerating conjunctive counts.
+- `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
 
