@@ -46,6 +46,25 @@ const MAX_FIELD: usize = 63;
 const QUERY_CACHE_MAX_ENTRIES: usize = 256;
 /// ...and a result set larger than this skips the cache, bounding memory.
 const QUERY_CACHE_MAX_ROWS: usize = 4096;
+/// Auto-tabling admission: only a fill whose matcher run cost at least this
+/// much is tabled. Replay saves exactly the matcher's cost, so a cheap query
+/// (a warm point lookup runs in a few microseconds) is never worth a cache
+/// entry; the shapes that qualify are the scan-class ones replay turns
+/// O(N) -> O(answers). This keeps the cache's memory proportional to queries
+/// that actually pay, not to query traffic.
+/// Calibrated for release; debug builds run the matcher an order of magnitude
+/// slower, so their threshold scales with them.
+const QUERY_TABLE_MIN_COST: std::time::Duration = if cfg!(debug_assertions) {
+    std::time::Duration::from_micros(800)
+} else {
+    std::time::Duration::from_micros(50)
+};
+
+/// The auto-tabling admission predicate: table only fills that cost enough to
+/// pay for their memory, and never oversized result sets.
+fn worth_tabling(fill_cost: std::time::Duration, rows: usize) -> bool {
+    fill_cost >= QUERY_TABLE_MIN_COST && rows <= QUERY_CACHE_MAX_ROWS
+}
 
 /// Reserved first byte of a grounded atom's symbol encoding. No real MeTTa symbol
 /// starts with NUL, so it cleanly separates a grounded `Atom` from a plain symbol in
@@ -307,8 +326,10 @@ impl MorkSpace {
                 }
             }
         }
+        let fill_started = std::time::Instant::now();
         let rows = query_btm_rows(&self.kernel.btm, &wrapped);
-        if rows.len() <= QUERY_CACHE_MAX_ROWS {
+        let fill_cost = fill_started.elapsed();
+        if worth_tabling(fill_cost, rows.len()) {
             let mut cache = self.query_cache.write().unwrap();
             if cache.len() < QUERY_CACHE_MAX_ENTRIES || cache.contains_key(&wrapped) {
                 cache.insert(wrapped, (rows.clone(), gen));
@@ -2171,6 +2192,44 @@ mod tests {
                 projected_results(&reference, &qv)
             );
         }
+    }
+
+    /// The auto-tabler admits by measured cost: a cheap query on a small store
+    /// never occupies cache memory, while a scan-class query on a large store
+    /// tables and replays exactly.
+    #[test]
+    fn tabling_admits_only_costly_queries() {
+        let needle_query = Atom::expr([Atom::var("x"), Atom::sym("mid"), Atom::var("y")]);
+
+        let mut small = MorkSpace::new();
+        small.add(Atom::expr([Atom::sym("g"), Atom::sym("mid"), Atom::sym("c")]));
+        assert_eq!(small.query(&needle_query).len(), 1);
+        assert_eq!(
+            small.query_cache.read().unwrap().len(),
+            0,
+            "a microsecond fill must not be tabled"
+        );
+
+        let mut big = MorkSpace::new();
+        for i in 0..30_000u32 {
+            big.add(Atom::expr([
+                Atom::sym(format!("f{i}")),
+                Atom::sym(format!("a{i}")),
+                Atom::sym(format!("b{i}")),
+            ]));
+        }
+        big.add(Atom::expr([Atom::sym("g"), Atom::sym("mid"), Atom::sym("c")]));
+        let qv = query_variables(&needle_query);
+        let first = big.query(&needle_query);
+        assert_eq!(
+            big.query_cache.read().unwrap().len(),
+            1,
+            "a scan-class fill must be tabled"
+        );
+        let replay = big.query(&needle_query);
+        let fresh = query_btm(&big.kernel.btm, &needle_query, Some(&big.grounded));
+        assert_eq!(projected_results(&first, &qv), projected_results(&fresh, &qv));
+        assert_eq!(projected_results(&replay, &qv), projected_results(&fresh, &qv));
     }
 
     /// fork() is copy-on-write isolation: the fork answers like the original
