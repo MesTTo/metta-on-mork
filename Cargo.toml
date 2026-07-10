@@ -30,3 +30,7 @@ factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exe
 [[example]]
 name = "factorized_count"
 required-features = ["factorized-aggregate"]
+
+[[example]]
+name = "semi_naive_step"
+required-features = ["semi-naive"]
