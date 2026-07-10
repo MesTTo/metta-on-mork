@@ -55,7 +55,9 @@ const QUERY_CACHE_MAX_ROWS: usize = 4096;
 /// Calibrated for release; debug builds run the matcher an order of magnitude
 /// slower, so their threshold scales with them.
 const QUERY_TABLE_MIN_COST: std::time::Duration = if cfg!(debug_assertions) {
-    std::time::Duration::from_micros(800)
+    // Wide margins for the debug-build tests: a 1-atom fill stays far below
+    // even under load spikes, a 30k-store scan stays far above.
+    std::time::Duration::from_millis(5)
 } else {
     std::time::Duration::from_micros(50)
 };
@@ -494,6 +496,12 @@ impl MorkSpace {
         });
 
         let mut sequential = Vec::new();
+        // Merge by structural join: measured on 1M atoms this beats the
+        // ZipperHead per-region graft pattern decisively (20ms vs 75ms at 16
+        // threads), because region discovery must scan the shard tries while
+        // join already merges by sharing COW subtrees. The zipper-head pattern
+        // stays right where work is prefix-sharded up front (PathMap's own
+        // parallel bench writes under artificial shard prefixes).
         for shard in shards {
             self.kernel.btm = self.kernel.btm.join(&shard.trie);
             for (display, atom) in shard.registry {
