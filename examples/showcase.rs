@@ -107,8 +107,9 @@ fn main() {
         seq.as_nanos() as f64 / par.as_nanos() as f64
     );
 
-    bar("[5] KERNEL  -- all six core benchmarks beat stock MORK (separately measured)");
-    println!("    clique 5-way 1234x | finite_domain 1.67x | transitive 1.5-2.4x");
-    println!("    process_calculus 2.0x | counter_machine 1.32x  (was 1.55x slower)");
+    bar("[5] KERNEL  -- upstream MORK main + the 28-PR set, complexity opt-ins gated");
+    println!("    conjunctive queries: native WCO join (GroundingSpace panics at 2k: #1076)");
+    println!("    column index 81415x @1.6M | factorized count 1556x @16M results");
+    println!("    features: semi-naive step | leapfrog join | factorized aggregates");
     println!("\n  HE-MeTTa -> MeTTa-IL -> {{MORK + rholang}} : the MORK lane, working.\n");
 }

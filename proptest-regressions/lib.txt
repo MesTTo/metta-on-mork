@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bbdc43d449e7caf0f3485dbb9101430d3a8201ca3dfefde22f79f432ee210681 # shrinks to atoms = [Var(0)], conj = [Expr([Sym(0)]), Expr([Sym(0)])]
+cc 2a1b38a8d3dade1a73eb888aa6d949e971bc8673f7c7f658595d9f6631576dd6 # shrinks to atoms = [Expr([Expr([Sym(0)])])], conj = [Expr([Expr([Var(0)])]), Expr([Sym(0)])]
+cc 2c5e4dfacb6954ff918eab98be3fc34b55f6313a5f77260af16198ef7b7cd65b # shrinks to atoms = [Expr([Sym(0), Expr([Sym(0)])])], conj = [Expr([Sym(0)]), Expr([Var(0), Expr([Var(1)])])]
