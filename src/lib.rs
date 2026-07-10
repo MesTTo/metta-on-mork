@@ -14,7 +14,6 @@
 //! symbols are stored as raw bytes rather than interned tokens.)
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hyperon_atom::matcher::{Bindings, BindingsSet};
@@ -166,9 +165,9 @@ pub struct MorkSpace {
     /// position), each carrying the mutation generation it was built at. A
     /// query bound only on non-leading positions seeks the index instead of
     /// scanning the relation; a stale entry (older generation) is rebuilt on
-    /// use. Interior mutability because `query` is `&self`; `MorkSpace` is not
-    /// `Sync`, so the RefCell is uncontended.
-    column_index_cache: RefCell<HashMap<(Vec<u8>, usize, usize), (PathMap<()>, u64)>>,
+    /// use. Interior mutability because `query` is `&self`; an RwLock so the
+    /// space itself stays `Send + Sync`-capable.
+    column_index_cache: std::sync::RwLock<HashMap<(Vec<u8>, usize, usize), (PathMap<()>, u64)>>,
     /// Bumped by every mutation (`add`, `remove`, `add_sexpr_text`, `step`):
     /// the O(1) staleness authority for the column indexes and the query cache.
     mutation_gen: u64,
@@ -178,7 +177,7 @@ pub struct MorkSpace {
     /// [`rows_to_bindings`], whose per-row fresh ids and live mutable-grounded
     /// filter make a replay indistinguishable from a live match; a repeated
     /// scan-class query is O(answers) instead of O(N) from the second call on.
-    query_cache: RefCell<HashMap<Vec<u8>, (Vec<RawRow>, u64)>>,
+    query_cache: std::sync::RwLock<HashMap<Vec<u8>, (Vec<RawRow>, u64)>>,
     /// One-way latch: true while every stored atom is variable-free. Byte-level
     /// fast paths (the factorized conjunctive count) match by trie prefix and
     /// cannot see a stored variable unifying with a pattern position (a bare
@@ -198,9 +197,9 @@ impl MorkSpace {
             common: SpaceCommon::default(),
             grounded: GroundedRegistry::default(),
             rejected_atoms: 0,
-            column_index_cache: RefCell::new(HashMap::new()),
+            column_index_cache: std::sync::RwLock::new(HashMap::new()),
             mutation_gen: 0,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: std::sync::RwLock::new(HashMap::new()),
             var_free: true,
         }
     }
@@ -301,7 +300,7 @@ impl MorkSpace {
         // indistinguishable from a live match.
         let gen = self.mutation_gen;
         {
-            let cache = self.query_cache.borrow();
+            let cache = self.query_cache.read().unwrap();
             if let Some((rows, g)) = cache.get(&wrapped) {
                 if *g == gen {
                     return rows_to_bindings(rows, &vars, &refs, &reg);
@@ -310,7 +309,7 @@ impl MorkSpace {
         }
         let rows = query_btm_rows(&self.kernel.btm, &wrapped);
         if rows.len() <= QUERY_CACHE_MAX_ROWS {
-            let mut cache = self.query_cache.borrow_mut();
+            let mut cache = self.query_cache.write().unwrap();
             if cache.len() < QUERY_CACHE_MAX_ENTRIES || cache.contains_key(&wrapped) {
                 cache.insert(wrapped, (rows.clone(), gen));
             }
@@ -329,7 +328,7 @@ impl MorkSpace {
         let prev_gen = self.mutation_gen;
         self.mutation_gen += 1;
         let gen = self.mutation_gen;
-        let mut cache = self.column_index_cache.borrow_mut();
+        let mut cache = self.column_index_cache.write().unwrap();
         for ((prefix, ncols, pos), (index, entry_gen)) in cache.iter_mut() {
             if *entry_gen != prev_gen {
                 continue;
@@ -363,21 +362,36 @@ impl MorkSpace {
     fn indexed_query(&self, query: &Atom) -> Option<BindingsSet> {
         let (classified, pos, value, vars, refs) = classify_index_route(query)?;
         let ncols = classified.args.len();
-        let facts = {
-            let mut cache = self.column_index_cache.borrow_mut();
-            let entry = cache
-                .entry((classified.functor_prefix.clone(), ncols, pos))
-                .or_insert_with(|| (PathMap::new(), u64::MAX));
-            if entry.1 != self.mutation_gen {
-                entry.0 = argindex::build_arg_index(
-                    &self.kernel.btm,
-                    &classified.functor_prefix,
-                    ncols,
-                    pos,
-                );
-                entry.1 = self.mutation_gen;
+        let key = (classified.functor_prefix.clone(), ncols, pos);
+        // Seek under the read lock when the index is fresh, so concurrent
+        // threads sharing one space seek in parallel; only a miss or a stale
+        // entry takes the write lock to (re)build.
+        let fresh_hit = {
+            let cache = self.column_index_cache.read().unwrap();
+            cache.get(&key).and_then(|(index, g)| {
+                (*g == self.mutation_gen).then(|| {
+                    argindex::arg_index_seek(index, &classified.functor_prefix, ncols, pos, &value)
+                })
+            })
+        };
+        let facts = match fresh_hit {
+            Some(facts) => facts,
+            None => {
+                let mut cache = self.column_index_cache.write().unwrap();
+                let entry = cache
+                    .entry(key)
+                    .or_insert_with(|| (PathMap::new(), u64::MAX));
+                if entry.1 != self.mutation_gen {
+                    entry.0 = argindex::build_arg_index(
+                        &self.kernel.btm,
+                        &classified.functor_prefix,
+                        ncols,
+                        pos,
+                    );
+                    entry.1 = self.mutation_gen;
+                }
+                argindex::arg_index_seek(&entry.0, &classified.functor_prefix, ncols, pos, &value)
             }
-            argindex::arg_index_seek(&entry.0, &classified.functor_prefix, ncols, pos, &value)
         };
 
         Some(indexed_facts_to_bindings(
@@ -393,7 +407,8 @@ impl MorkSpace {
         let gen = self.mutation_gen;
         let indexes = self
             .column_index_cache
-            .borrow()
+            .read()
+            .unwrap()
             .iter()
             .filter(|(_, (_, entry_gen))| *entry_gen == gen)
             .map(|(key, (index, _))| (key.clone(), index.clone()))
@@ -1348,23 +1363,23 @@ mod tests {
     /// whose value can change in place, with by-current-value equality and `is_mutable`
     /// true. Lets the codec's mutable-grounded path be tested without the hyperon stdlib.
     #[derive(Clone, Debug)]
-    struct MutCell(Rc<RefCell<i64>>);
+    struct MutCell(std::sync::Arc<std::sync::RwLock<i64>>);
     impl MutCell {
         fn new(v: i64) -> Self {
-            Self(Rc::new(RefCell::new(v)))
+            Self(std::sync::Arc::new(std::sync::RwLock::new(v)))
         }
         fn set(&self, v: i64) {
-            *self.0.borrow_mut() = v;
+            *self.0.write().unwrap() = v;
         }
     }
     impl std::fmt::Display for MutCell {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "(Cell {})", self.0.borrow())
+            write!(f, "(Cell {})", self.0.read().unwrap())
         }
     }
     impl PartialEq for MutCell {
         fn eq(&self, other: &Self) -> bool {
-            *self.0.borrow() == *other.0.borrow()
+            *self.0.read().unwrap() == *other.0.read().unwrap()
         }
     }
     impl Grounded for MutCell {
@@ -1512,6 +1527,10 @@ mod tests {
     }
 
     assert_impl_all!(MorkSnapshot: Send, Sync);
+    // The vision assertion: one MorkSpace shared across threads -- queries are
+    // &self, every cache is lock-based, the kernel's z3 table is locked, and
+    // atoms themselves are Send + Sync on the thread-safe hyperon base.
+    assert_impl_all!(MorkSpace: Send, Sync);
 
     proptest! {
         #[test]
@@ -1663,7 +1682,7 @@ mod tests {
     }
 
     /// Two cells holding the same value stored in different atoms must stay distinct (identity,
-    /// not display), mutation through one must be visible on query (Rc sharing), and a query
+    /// not display), mutation through one must be visible on query (shared cell), and a query
     /// holding a cell must match a stored cell by *current* value (the live-value post-filter).
     #[test]
     fn mutable_grounded_identity_and_live_value_match() {
