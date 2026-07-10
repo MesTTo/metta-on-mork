@@ -87,6 +87,21 @@ fn is_mutable_grounded(atom: &Atom) -> bool {
     matches!(atom, Atom::Grounded(g) if g.as_grounded().is_mutable())
 }
 
+/// Length of the encoded pattern's ground prefix: its bytes up to the first
+/// variable item, scanning item-by-item so a `$` inside a symbol payload is
+/// never mistaken for a variable tag.
+fn ground_prefix_len(bytes: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match mork::__mork_expr::maybe_byte_item(bytes[pos]) {
+            Ok(Tag::NewVar) | Ok(Tag::VarRef(_)) | Err(_) => return pos,
+            Ok(Tag::Arity(_)) => pos += 1,
+            Ok(Tag::SymbolSize(size)) => pos += 1 + size as usize,
+        }
+    }
+    pos
+}
+
 /// Whether `atom` holds a mutable grounded value anywhere in its tree: such
 /// atoms need the space's identity registry at encode time.
 fn contains_mutable_grounded(atom: &Atom) -> bool {
@@ -430,6 +445,136 @@ impl MorkSpace {
         Some(indexed_facts_to_bindings(
             &facts, &classified, pos, &vars, &refs, self.grounded.clone(), query,
         ))
+    }
+
+    /// Runs one multi-pattern -> multi-template rewrite directly: the wiki's
+    /// Transform space operation (and the MORK HTTP server's `transform`
+    /// command), without installing exec atoms or running the scheduler. One
+    /// worst-case-optimal join over the conjunction of `patterns`, one
+    /// templated emit per match; a variable shared between patterns is a join
+    /// variable, and template variables refer to pattern variables. Returns
+    /// `(matches, any_new)`; `None` when something does not encode or a
+    /// mutable grounded value appears (byte-level transform cannot honor its
+    /// live-value semantics).
+    pub fn transform(&mut self, patterns: &[Atom], templates: &[Atom]) -> Option<(usize, bool)> {
+        if patterns.is_empty()
+            || templates.is_empty()
+            || patterns.len() > MAX_FIELD - 1
+            || templates.len() > MAX_FIELD - 1
+        {
+            return None;
+        }
+        for atom in patterns.iter().chain(templates) {
+            if contains_mutable_grounded(atom) {
+                return None;
+            }
+            // Emitted atoms may carry grounded markers; register them so later
+            // decodes recover the values.
+            self.grounded.register(atom);
+        }
+        let mut conj_p = vec![Atom::sym(",")];
+        conj_p.extend(patterns.iter().cloned());
+        let mut conj_t = vec![Atom::sym(",")];
+        conj_t.extend(templates.iter().cloned());
+        let exec = Atom::expr([
+            Atom::sym("exec"),
+            Atom::sym("0"),
+            Atom::expr(conj_p),
+            Atom::expr(conj_t),
+        ]);
+        // One buffer for the whole exec atom, then in-place offsets to the
+        // pattern and template sub-expressions (the kernel's own convention:
+        // the template's VarRefs stay relative to the pattern's variables).
+        let mut vars = Vec::new();
+        let mut bytes = Vec::new();
+        let mut refs = Vec::new();
+        let mut sink = GroundedSink::Query(&mut refs);
+        if encode_atom(&exec, &mut vars, &mut bytes, &mut sink).is_err() || !refs.is_empty() {
+            return None;
+        }
+        let head_len = 1 + argindex::fact_subterm_len(&bytes[1..]);
+        let loc_len = argindex::fact_subterm_len(&bytes[head_len..]);
+        let pat_off = head_len + loc_len;
+        let pat_len = argindex::fact_subterm_len(&bytes[pat_off..]);
+        let tpl_off = pat_off + pat_len;
+        let pat_expr = Expr {
+            ptr: bytes[pat_off..].as_ptr() as *mut u8,
+        };
+        let tpl_expr = Expr {
+            ptr: bytes[tpl_off..].as_ptr() as *mut u8,
+        };
+        // The kernel inserts its third argument into the read snapshot (MM2
+        // rules may match rules). Space-level transform must match stored
+        // atoms only, so anchor on an atom that is already present -- a set
+        // no-op -- instead of the exec scaffold; an empty space has nothing to
+        // match at all.
+        let anchor: Vec<u8> = {
+            use pathmap::zipper::{ZipperIteration, ZipperMoving};
+            let mut rz = self.kernel.btm.read_zipper();
+            if !rz.to_next_val() {
+                return Some((0, false));
+            }
+            rz.path().to_vec()
+        };
+        let anchor_expr = Expr {
+            ptr: anchor.as_ptr() as *mut u8,
+        };
+        let result = self
+            .kernel
+            .transform_multi_multi_(pat_expr, tpl_expr, anchor_expr);
+        // Templates may write variables and everything derived is stale.
+        self.var_free = false;
+        self.mutation_gen += 1;
+        Some(result)
+    }
+
+    /// Restriction, the wiki's `x <| y` as a pattern-prefix gate: keeps only
+    /// the atoms under `pattern`'s ground prefix -- its encoded bytes up to
+    /// the first variable, per Data-in-MORK's "construct values with a ground
+    /// prefix, defer variables to the suffix". One O(prefix) descent selects
+    /// the whole surviving subtree by structure; nothing is enumerated.
+    /// Returns the surviving atom count, or `None` for an unencodable pattern
+    /// or one carrying a mutable grounded value.
+    pub fn restrict_to_prefix(&mut self, pattern: &Atom) -> Option<usize> {
+        use pathmap::zipper::{ZipperInfallibleSubtries, ZipperWriting};
+        if contains_mutable_grounded(pattern) {
+            return None;
+        }
+        let mut vars = Vec::new();
+        let mut bytes = Vec::new();
+        if encode_atom(pattern, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly).is_err() {
+            return None;
+        }
+        let prefix = &bytes[..ground_prefix_len(&bytes)];
+        let sub = self.kernel.btm.read_zipper_at_path(prefix).make_map();
+        let mut restricted = PathMap::new();
+        if sub.val_count() > 0 || self.kernel.btm.get_val_at(prefix).is_some() {
+            restricted.write_zipper_at_path(prefix).graft_map(sub);
+            if self.kernel.btm.get_val_at(prefix).is_some() {
+                restricted.insert(prefix, ());
+            }
+        }
+        self.kernel.btm = restricted;
+        self.mutation_gen += 1;
+        Some(self.kernel.btm.val_count())
+    }
+
+    /// Serializes the space's paths to a compact binary file (PathMap's paths
+    /// serialization; the wiki's write-the-space-to-disk lane). Grounded
+    /// registries are not persisted: mutable grounded atoms cannot round-trip
+    /// a process boundary, and immutable ones decode as their display form.
+    pub fn save_paths(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.kernel.backup_paths(path).map(|_| ())
+    }
+
+    /// Loads a [`save_paths`](Self::save_paths) file into this space (union
+    /// with current contents). Conservatively drops the var-freeness latch:
+    /// the file may hold variable-bearing atoms.
+    pub fn load_paths(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.kernel.restore_paths(path).map(|_| ())?;
+        self.var_free = false;
+        self.mutation_gen += 1;
+        Ok(())
     }
 
     /// Bulk-loads atoms across threads, exploiting exactly the property the
@@ -2461,6 +2606,136 @@ mod tests {
         let fresh = query_btm(&big.kernel.btm, &needle_query, Some(&big.grounded));
         assert_eq!(projected_results(&first, &qv), projected_results(&fresh, &qv));
         assert_eq!(projected_results(&replay, &qv), projected_results(&fresh, &qv));
+    }
+
+    /// transform() must equal querying the conjunction and adding every
+    /// instantiated template -- the reference semantics of the wiki's
+    /// Transform operation.
+    #[test]
+    fn transform_materializes_the_join_directly() {
+        let mut space = MorkSpace::new();
+        for (a, b) in [("a", "b"), ("b", "c"), ("c", "d")] {
+            space.add(Atom::expr([Atom::sym("edge"), Atom::sym(a), Atom::sym(b)]));
+        }
+        let patterns = [
+            Atom::expr([Atom::sym("edge"), Atom::var("x"), Atom::var("m")]),
+            Atom::expr([Atom::sym("edge"), Atom::var("m"), Atom::var("y")]),
+        ];
+        let templates = [Atom::expr([Atom::sym("path"), Atom::var("x"), Atom::var("y")])];
+        let (matches, any_new) = space.transform(&patterns, &templates).unwrap();
+        assert_eq!(matches, 2, "a 4-node chain has two 2-hop pairs");
+        assert!(any_new);
+        let paths = space.query(&Atom::expr([
+            Atom::sym("path"),
+            Atom::var("p"),
+            Atom::var("q"),
+        ]));
+        assert_eq!(paths.len(), 2);
+        // Idempotent re-run: same matches, nothing new.
+        let (matches2, any_new2) = space.transform(&patterns, &templates).unwrap();
+        assert_eq!(matches2, 2);
+        assert!(!any_new2);
+    }
+
+    proptest! {
+        /// Randomized transform differential against query-then-add.
+        #[test]
+        fn transform_equals_query_then_add(
+            atoms in prop::collection::vec(arb_ground_atom(), 0..10),
+            pats in prop::collection::vec(arb_atom(), 1..3),
+            tpls in prop::collection::vec(arb_atom(), 1..3),
+        ) {
+            let vars = query_vars();
+            let patterns: Vec<Atom> = pats.iter().map(|a| gen_atom_to_atom(a, &vars)).collect();
+            let templates: Vec<Atom> = tpls.iter().map(|a| gen_atom_to_atom(a, &vars)).collect();
+            // The kernel emits a fresh variable for a template var unbound by the
+            // patterns; the reference would keep the caller's name. Exclude that
+            // shape: template vars must all occur in the patterns.
+            let pattern_vars: HashSet<VariableAtom> = patterns
+                .iter()
+                .flat_map(|p| p.iter().filter_type::<&VariableAtom>().cloned())
+                .collect();
+            for t in &templates {
+                for v in t.iter().filter_type::<&VariableAtom>() {
+                    prop_assume!(pattern_vars.contains(v));
+                }
+            }
+            let mut base = MorkSpace::new();
+            for a in &atoms {
+                base.add(gen_atom_to_atom(a, &vars));
+            }
+
+            let mut direct = base.fork();
+            let transformed = direct.transform(&patterns, &templates);
+            prop_assume!(transformed.is_some());
+            let (matches, _any_new) = transformed.unwrap();
+
+            let mut reference = base.fork();
+            let mut conj = vec![Atom::sym(",")];
+            conj.extend(patterns.iter().cloned());
+            let rows = reference.query(&Atom::expr(conj));
+            prop_assert_eq!(matches, rows.len(), "match count vs join rows");
+            for b in rows.iter() {
+                for t in &templates {
+                    let instantiated =
+                        hyperon_atom::matcher::apply_bindings_to_atom_move(t.clone(), b);
+                    reference.add(instantiated);
+                }
+            }
+            prop_assert_eq!(space_atom_set(&direct), space_atom_set(&reference));
+        }
+    }
+
+    /// Restriction keeps exactly the subtree under the pattern's ground prefix.
+    #[test]
+    fn restriction_is_a_prefix_gate() {
+        let mut space = MorkSpace::new();
+        for atom in [
+            Atom::expr([Atom::sym("rel"), Atom::sym("a"), Atom::sym("1")]),
+            Atom::expr([Atom::sym("rel"), Atom::sym("a"), Atom::sym("2")]),
+            Atom::expr([Atom::sym("rel"), Atom::sym("b"), Atom::sym("3")]),
+            Atom::expr([Atom::sym("other"), Atom::sym("a"), Atom::sym("9")]),
+        ] {
+            space.add(atom);
+        }
+        // Everything survives a bare-variable gate (empty ground prefix).
+        let mut all = space.fork();
+        assert_eq!(all.restrict_to_prefix(&Atom::var("x")), Some(4));
+
+        let kept = space
+            .restrict_to_prefix(&Atom::expr([
+                Atom::sym("rel"),
+                Atom::sym("a"),
+                Atom::var("x"),
+            ]))
+            .unwrap();
+        assert_eq!(kept, 2);
+        assert_eq!(
+            space
+                .query(&Atom::expr([Atom::sym("rel"), Atom::sym("a"), Atom::var("v")]))
+                .len(),
+            2
+        );
+        assert!(space
+            .query(&Atom::expr([Atom::sym("other"), Atom::var("a"), Atom::var("b")]))
+            .is_empty());
+    }
+
+    /// save_paths/load_paths round-trips the trie through disk.
+    #[test]
+    fn paths_roundtrip_through_disk() {
+        let mut space = MorkSpace::new();
+        space.add(Atom::expr([Atom::sym("fact"), Atom::sym("x")]));
+        space.add(Atom::expr([Atom::sym("rule"), Atom::var("v")]));
+        let file = std::env::temp_dir().join(format!(
+            "metta-on-mork-paths-{}.bin",
+            std::process::id()
+        ));
+        space.save_paths(&file).unwrap();
+        let mut restored = MorkSpace::new();
+        restored.load_paths(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(space_atom_set(&restored), space_atom_set(&space));
     }
 
     /// Parallel bulk load must land exactly the atoms a sequential add loop

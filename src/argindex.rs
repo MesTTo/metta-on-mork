@@ -43,6 +43,12 @@ enum Item {
     Var(usize),
 }
 
+/// Length in bytes of the first complete subterm of `bytes` (re-exported for
+/// offset arithmetic over whole encoded atoms).
+pub fn fact_subterm_len(bytes: &[u8]) -> usize {
+    first_subterm_len(bytes)
+}
+
 /// Split a fact's argument bytes into `ncols` encoded subterms.
 pub fn split_columns(bytes: &[u8], ncols: usize) -> Vec<&[u8]> {
     let mut cols = Vec::with_capacity(ncols);
