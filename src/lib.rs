@@ -271,6 +271,10 @@ fn decode_var(ctx: &DecodeCtx, index: usize) -> Atom {
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
 /// `Send + Sync` `MorkSnapshot`.
 fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry>) -> BindingsSet {
+    // The empty conjunction `(,)` is a fold over zero sub-queries: one empty binding.
+    if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+        return BindingsSet::single();
+    }
     let Some((mut wrapped, vars, refs)) = wrap_pattern(query) else {
         return BindingsSet::empty();
     };
@@ -436,19 +440,59 @@ impl MorkSnapshot {
     }
 }
 
-/// Encodes `query` into the `(, <pattern>)` wrapper `query_multi` expects, returning
-/// the bytes, the variables in introduction order, and the mutable-grounded positions
-/// `(var index, atom)` to post-filter by live value (empty for the common case).
+/// Returns the conjuncts of a top-level `(, q1 .. qn)` query (hyperon-space's
+/// `COMMA_SYMBOL` contract: "Query may include sub-queries glued by [the comma]"),
+/// or `None` for an ordinary single-pattern query.
+fn conjuncts(query: &Atom) -> Option<&[Atom]> {
+    let Atom::Expression(e) = query else {
+        return None;
+    };
+    match e.children().first() {
+        Some(Atom::Symbol(s)) if s.name() == "," => Some(&e.children()[1..]),
+        _ => None,
+    }
+}
+
+/// Encodes `query` into the `(, <p1> .. <pn>)` multi-pattern form `query_multi`
+/// expects, returning the bytes, the variables in introduction order, and the
+/// mutable-grounded positions `(var index, atom)` to post-filter by live value
+/// (empty for the common case).
+///
+/// A top-level `(, q1 .. qn)` query encodes each conjunct as its own factor of
+/// the kernel's multi-pattern query, sharing one variable introduction order, so
+/// a variable used in two conjuncts becomes a `VarRef` across factors -- a join
+/// variable the kernel's worst-case-optimal join matches natively, instead of the
+/// per-conjunct query-and-thread loop (and its intermediate-product blowup) that
+/// an interpreter-side conjunction costs.
 fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize, Atom)>)> {
     let mut vars = Vec::new();
     let mut refs = Vec::new();
     let mut wrapped = Vec::with_capacity(64);
-    wrapped.push(item_byte(Tag::Arity(2)));
-    wrapped.push(item_byte(Tag::SymbolSize(1)));
-    wrapped.push(b',');
     let mut sink = GroundedSink::Query(&mut refs);
-    if encode_atom(query, &mut vars, &mut wrapped, &mut sink).is_err() {
-        return None;
+    match conjuncts(query) {
+        Some(qs) if !qs.is_empty() => {
+            // The wrapper's arity field also holds the `,` head, so at most
+            // MAX_FIELD - 1 conjuncts encode.
+            if qs.len() > MAX_FIELD - 1 {
+                return None;
+            }
+            wrapped.push(item_byte(Tag::Arity((1 + qs.len()) as u8)));
+            wrapped.push(item_byte(Tag::SymbolSize(1)));
+            wrapped.push(b',');
+            for q in qs {
+                if encode_atom(q, &mut vars, &mut wrapped, &mut sink).is_err() {
+                    return None;
+                }
+            }
+        }
+        _ => {
+            wrapped.push(item_byte(Tag::Arity(2)));
+            wrapped.push(item_byte(Tag::SymbolSize(1)));
+            wrapped.push(b',');
+            if encode_atom(query, &mut vars, &mut wrapped, &mut sink).is_err() {
+                return None;
+            }
+        }
     }
     Some((wrapped, vars, refs))
 }
@@ -1448,5 +1492,104 @@ mod tests {
             "MORK visit enumerated {} of {}",
             counter.0, target
         );
+    }
+
+    /// The Space trait's own doc example: `(, (A $x) ($x C))` over {(A B), (B C)}
+    /// joins on $x natively (one kernel multi-factor query, not a per-conjunct loop).
+    #[test]
+    fn conjunctive_query_joins_on_the_shared_variable() {
+        let atoms = vec![
+            Atom::expr([Atom::sym("A"), Atom::sym("B")]),
+            Atom::expr([Atom::sym("B"), Atom::sym("C")]),
+        ];
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        for a in &atoms {
+            ground.add(a.clone());
+            mork.add(a.clone());
+        }
+        let query = Atom::expr([
+            Atom::sym(","),
+            Atom::expr([Atom::sym("A"), Atom::var("x")]),
+            Atom::expr([Atom::var("x"), Atom::sym("C")]),
+        ]);
+        let vars = query_variables(&query);
+        assert_eq!(
+            projected_results(&mork.query(&query), &vars),
+            projected_results(&ground.query(&query), &vars),
+        );
+        // And concretely: exactly one result, x = B.
+        let results = mork.query(&query);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results.iter().next().unwrap().resolve(&VariableAtom::new("x")),
+            Some(Atom::sym("B"))
+        );
+    }
+
+    /// A conjunction with no shared variable is the cross product, same as
+    /// GroundingSpace's fold; the empty conjunction is one empty binding.
+    #[test]
+    fn conjunction_edge_shapes_match_grounding_space() {
+        let atoms = vec![
+            Atom::expr([Atom::sym("p"), Atom::sym("1")]),
+            Atom::expr([Atom::sym("p"), Atom::sym("2")]),
+            Atom::expr([Atom::sym("q"), Atom::sym("3")]),
+        ];
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        for a in &atoms {
+            ground.add(a.clone());
+            mork.add(a.clone());
+        }
+        for query in [
+            // cross product: 2 x 1 results
+            Atom::expr([
+                Atom::sym(","),
+                Atom::expr([Atom::sym("p"), Atom::var("a")]),
+                Atom::expr([Atom::sym("q"), Atom::var("b")]),
+            ]),
+            // single conjunct == plain query
+            Atom::expr([Atom::sym(","), Atom::expr([Atom::sym("p"), Atom::var("a")])]),
+            // empty conjunction
+            Atom::expr([Atom::sym(",")]),
+            // three-way join with a chained variable
+            Atom::expr([
+                Atom::sym(","),
+                Atom::expr([Atom::sym("p"), Atom::var("a")]),
+                Atom::expr([Atom::sym("p"), Atom::var("b")]),
+                Atom::expr([Atom::sym("q"), Atom::var("c")]),
+            ]),
+        ] {
+            let vars = query_variables(&query);
+            assert_eq!(
+                projected_results(&mork.query(&query), &vars),
+                projected_results(&ground.query(&query), &vars),
+                "diverged on {query}",
+            );
+        }
+    }
+
+    proptest! {
+        /// Randomized conjunctions over the shared variable pool: the native
+        /// multi-factor join returns exactly GroundingSpace's fold semantics,
+        /// including cross-conjunct variable joins and products.
+        #[test]
+        fn conjunctive_query_matches_grounding_space(
+            atoms in prop::collection::vec(arb_ground_atom(), 0..12),
+            conj in prop::collection::vec(arb_atom(), 1..4),
+        ) {
+            let vars = query_vars();
+            let mut children = vec![Atom::sym(",")];
+            children.extend(conj.iter().map(|c| gen_atom_to_atom(c, &vars)));
+            let query = Atom::expr(children);
+            let qv = query_variables(&query);
+            let (ground, mork) = insert_unique_atoms(&atoms);
+
+            prop_assert_eq!(
+                projected_results(&mork.query(&query), &qv),
+                projected_results(&ground.query(&query), &qv)
+            );
+        }
     }
 }
