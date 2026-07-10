@@ -32,14 +32,28 @@ fn main() {
             Atom::sym(format!("n{}", n / 2)),
         ]);
 
-        let snap = space.snapshot();
+        // A snapshot taken before any query carries no index: its query is the
+        // plain matcher scan.
+        let cold_snap = space.snapshot();
         let t = Instant::now();
-        let scan_results = snap.query(&q).len();
+        let scan_results = cold_snap.query(&q).len();
         let scan = t.elapsed();
 
         let t = Instant::now();
         let first = space.query(&q).len();
         let build = t.elapsed();
+
+        // A snapshot taken after the index exists carries it (copy-on-write),
+        // so Send+Sync parallel workers seek too.
+        let warm_snap = space.snapshot();
+        let t = Instant::now();
+        let mut snap_results = 0usize;
+        const SNAP_RUNS: u32 = 100;
+        for _ in 0..SNAP_RUNS {
+            snap_results = warm_snap.query(&q).len();
+        }
+        let snap_steady = t.elapsed() / SNAP_RUNS;
+        assert_eq!(snap_results, 1);
 
         let t = Instant::now();
         let mut steady_results = 0usize;
@@ -54,7 +68,7 @@ fn main() {
         assert_eq!(steady_results, 1);
         let ratio = scan.as_secs_f64() / steady.as_secs_f64().max(1e-9);
         println!(
-            "N={n:8} | matcher scan {scan:>10.2?} | index build+query {build:>10.2?} | steady query {steady:>10.2?} | steady {ratio:9.1}x"
+            "N={n:8} | matcher scan {scan:>10.2?} | index build+query {build:>10.2?} | steady query {steady:>10.2?} | snapshot seek {snap_steady:>10.2?} | steady {ratio:9.1}x"
         );
     }
 }

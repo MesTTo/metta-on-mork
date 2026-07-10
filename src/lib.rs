@@ -275,6 +275,41 @@ impl MorkSpace {
         query_btm(&self.kernel.btm, query, Some(&self.grounded))
     }
 
+    /// Incrementally maintains the fresh column indexes across one mutation:
+    /// each cached index of the mutated fact's relation absorbs the fact as
+    /// one O(1) permuted-key insert or remove, instead of being invalidated
+    /// and paying the O(N) rebuild on the next selective query (the
+    /// incremental-delta shape of alloy-mork's fac4). Indexes of other
+    /// relations are untouched by the mutation and stay valid; an entry that
+    /// was already stale stays stale and rebuilds on next use.
+    fn update_column_indexes(&mut self, bytes: &[u8], add: bool) {
+        let prev_gen = self.mutation_gen;
+        self.mutation_gen += 1;
+        let gen = self.mutation_gen;
+        let mut cache = self.column_index_cache.borrow_mut();
+        for ((prefix, ncols, pos), (index, entry_gen)) in cache.iter_mut() {
+            if *entry_gen != prev_gen {
+                continue;
+            }
+            if bytes.starts_with(prefix) {
+                match argindex::permuted_fact_key(&bytes[prefix.len()..], *ncols, *pos) {
+                    Some(key) => {
+                        if add {
+                            index.insert(&key, ());
+                        } else {
+                            index.remove(&key);
+                        }
+                        *entry_gen = gen;
+                    }
+                    // Unsplittable under this shape: leave the entry stale.
+                    None => {}
+                }
+            } else {
+                *entry_gen = gen;
+            }
+        }
+    }
+
     /// Answers a single-factor query bound only on non-leading argument
     /// positions through the maintained column index (see [`argindex`]): a
     /// prefix seek plus a residual byte filter instead of the matcher's
@@ -283,32 +318,8 @@ impl MorkSpace {
     /// matcher. Agreement with the matcher is sealed by this crate's proptest
     /// differential.
     fn indexed_query(&self, query: &Atom) -> Option<BindingsSet> {
-        if conjuncts(query).is_some() {
-            return None;
-        }
-        let (wrapped, vars, refs) = wrap_pattern(query)?;
-        // Strip the `(, ...)` wrapper: Arity(2) + SymbolSize(1) + b','.
-        let pattern = &wrapped[3..];
-        let classified = argindex::classify_single_factor(pattern)?;
-        let args = &classified.args;
-        // Leading argument bound: the primary trie already seeks; the general
-        // path is already a descent, not a scan.
-        if matches!(args.first(), Some(argindex::ArgClass::Bound(_))) {
-            return None;
-        }
-        // The most selective bound position, by the cheap proxy of the longest
-        // encoded value (the fork probed bucket sizes; the choice affects only
-        // speed -- the residual filter keeps every choice exact).
-        let (pos, value) = args
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| match a {
-                argindex::ArgClass::Bound(v) => Some((i, v)),
-                argindex::ArgClass::Free => None,
-            })
-            .max_by_key(|(_, v)| v.len())?;
-        let ncols = args.len();
-
+        let (classified, pos, value, vars, refs) = classify_index_route(query)?;
+        let ncols = classified.args.len();
         let facts = {
             let mut cache = self.column_index_cache.borrow_mut();
             let entry = cache
@@ -323,55 +334,12 @@ impl MorkSpace {
                 );
                 entry.1 = self.mutation_gen;
             }
-            argindex::arg_index_seek(&entry.0, &classified.functor_prefix, ncols, pos, value)
+            argindex::arg_index_seek(&entry.0, &classified.functor_prefix, ncols, pos, &value)
         };
 
-        let mut reg = self.grounded.clone();
-        reg.register(query);
-        let mut set = BindingsSet::empty();
-        'fact: for fact in &facts {
-            let cols = argindex::split_columns(&fact[classified.functor_prefix.len()..], ncols);
-            if cols.len() != ncols {
-                continue;
-            }
-            let result_id = next_variable_id();
-            let mut acc = BindingsSet::single();
-            let mut var_idx = 0usize;
-            for (i, arg) in args.iter().enumerate() {
-                match arg {
-                    argindex::ArgClass::Bound(v) => {
-                        // The seek filtered `pos`; the residual bound columns
-                        // filter here, byte-exact (the store is variable-free).
-                        if i != pos && cols[i] != &v[..] {
-                            continue 'fact;
-                        }
-                    }
-                    argindex::ArgClass::Free => {
-                        let mut posn = 0usize;
-                        let mut ctx = DecodeCtx {
-                            ns: 1,
-                            var_counter: 0,
-                            grounded: Some(&reg),
-                            query_vars: &vars,
-                            result_id,
-                        };
-                        let Some(atom) = decode_atom(cols[i], &mut posn, &mut ctx) else {
-                            continue 'fact;
-                        };
-                        let Some(var) = vars.get(var_idx) else {
-                            continue 'fact;
-                        };
-                        acc = bind_or_equate(acc, var.clone(), atom);
-                        var_idx += 1;
-                        if acc.is_empty() {
-                            continue 'fact;
-                        }
-                    }
-                }
-            }
-            set.extend(apply_live_refs(acc, &refs, &vars));
-        }
-        Some(set)
+        Some(indexed_facts_to_bindings(
+            &facts, &classified, pos, &vars, &refs, self.grounded.clone(), query,
+        ))
     }
 
     /// A `Send + Sync` read-only snapshot for data-parallel querying: a cheap
@@ -379,9 +347,18 @@ impl MorkSpace {
     /// MORK's `PathMap` is `Send + Sync`, so this is the parallel querying that
     /// Hyperon's `Rc<RefCell>` spaces (issue #410) cannot express.
     pub fn snapshot(&self) -> MorkSnapshot {
+        let gen = self.mutation_gen;
+        let indexes = self
+            .column_index_cache
+            .borrow()
+            .iter()
+            .filter(|(_, (_, entry_gen))| *entry_gen == gen)
+            .map(|(key, (index, _))| (key.clone(), index.clone()))
+            .collect();
         MorkSnapshot {
             btm: self.kernel.btm.clone(),
             var_free: self.var_free,
+            indexes,
         }
     }
 }
@@ -445,6 +422,106 @@ fn apply_live_refs(
         }
     }
     filtered
+}
+
+/// Classifies a query for the column-index route: single factor, the fork's
+/// admitted fragment, not leading-bound. Returns the classification, the chosen
+/// (most selective by longest encoded value) bound position and its value, plus
+/// the pattern's variables and mutable-grounded refs.
+#[allow(clippy::type_complexity)]
+fn classify_index_route(
+    query: &Atom,
+) -> Option<(
+    argindex::Classified,
+    usize,
+    Vec<u8>,
+    Vec<VariableAtom>,
+    Vec<(usize, Atom)>,
+)> {
+    if conjuncts(query).is_some() {
+        return None;
+    }
+    let (wrapped, vars, refs) = wrap_pattern(query)?;
+    // Strip the `(, ...)` wrapper: Arity(2) + SymbolSize(1) + b','.
+    let classified = argindex::classify_single_factor(&wrapped[3..])?;
+    if matches!(
+        classified.args.first(),
+        Some(argindex::ArgClass::Bound(_))
+    ) {
+        // Leading argument bound: the primary trie already seeks.
+        return None;
+    }
+    let (pos, value) = classified
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| match a {
+            argindex::ArgClass::Bound(v) => Some((i, v.clone())),
+            argindex::ArgClass::Free => None,
+        })
+        .max_by_key(|(_, v)| v.len())?;
+    Some((classified, pos, value, vars, refs))
+}
+
+/// Turns the facts an index seek returned into the matcher-identical
+/// `BindingsSet`: residual bound columns filter byte-exact (the store is
+/// variable-free under the latch), free columns decode and bind, and the
+/// mutable-grounded live-value post-filter applies. Shared by the live space
+/// and the snapshot.
+fn indexed_facts_to_bindings(
+    facts: &[Vec<u8>],
+    classified: &argindex::Classified,
+    pos: usize,
+    vars: &[VariableAtom],
+    refs: &[(usize, Atom)],
+    mut reg: GroundedRegistry,
+    query: &Atom,
+) -> BindingsSet {
+    let args = &classified.args;
+    let ncols = args.len();
+    reg.register(query);
+    let mut set = BindingsSet::empty();
+    'fact: for fact in facts {
+        let cols = argindex::split_columns(&fact[classified.functor_prefix.len()..], ncols);
+        if cols.len() != ncols {
+            continue;
+        }
+        let result_id = next_variable_id();
+        let mut acc = BindingsSet::single();
+        let mut var_idx = 0usize;
+        for (i, arg) in args.iter().enumerate() {
+            match arg {
+                argindex::ArgClass::Bound(v) => {
+                    if i != pos && cols[i] != &v[..] {
+                        continue 'fact;
+                    }
+                }
+                argindex::ArgClass::Free => {
+                    let mut posn = 0usize;
+                    let mut ctx = DecodeCtx {
+                        ns: 1,
+                        var_counter: 0,
+                        grounded: Some(&reg),
+                        query_vars: vars,
+                        result_id,
+                    };
+                    let Some(atom) = decode_atom(cols[i], &mut posn, &mut ctx) else {
+                        continue 'fact;
+                    };
+                    let Some(var) = vars.get(var_idx) else {
+                        continue 'fact;
+                    };
+                    acc = bind_or_equate(acc, var.clone(), atom);
+                    var_idx += 1;
+                    if acc.is_empty() {
+                        continue 'fact;
+                    }
+                }
+            }
+        }
+        set.extend(apply_live_refs(acc, refs, vars));
+    }
+    set
 }
 
 /// The byte-level query against a bare trie, shared by `MorkSpace` and the
@@ -537,6 +614,11 @@ pub struct MorkSnapshot {
     /// Carried var-freeness latch (see [`MorkSpace`]): gates the byte-level
     /// fast paths on this snapshot.
     var_free: bool,
+    /// The space's fresh column indexes at snapshot time (copy-on-write clones,
+    /// so carrying them is O(cached indexes), not O(data)). A selective query
+    /// on the snapshot seeks these exactly like the live space; a shape with no
+    /// carried index falls through to the matcher (snapshots never build).
+    indexes: HashMap<(Vec<u8>, usize, usize), PathMap<()>>,
 }
 
 /// A query pattern encoded once for repeated execution, so the per-query encode (the
@@ -554,8 +636,36 @@ pub struct PreparedQuery {
 }
 
 impl MorkSnapshot {
-    /// Query the snapshot; safe to call concurrently from many threads.
+    /// Query the snapshot; safe to call concurrently from many threads. A
+    /// selective single-factor query seeks the carried column indexes (frozen
+    /// at snapshot time); everything else runs the matcher.
     pub fn query(&self, query: &Atom) -> BindingsSet {
+        if self.var_free {
+            if let Some((classified, pos, value, vars, refs)) = classify_index_route(query) {
+                let ncols = classified.args.len();
+                if let Some(index) =
+                    self.indexes
+                        .get(&(classified.functor_prefix.clone(), ncols, pos))
+                {
+                    let facts = argindex::arg_index_seek(
+                        index,
+                        &classified.functor_prefix,
+                        ncols,
+                        pos,
+                        &value,
+                    );
+                    return indexed_facts_to_bindings(
+                        &facts,
+                        &classified,
+                        pos,
+                        &vars,
+                        &refs,
+                        GroundedRegistry::default(),
+                        query,
+                    );
+                }
+            }
+        }
         query_btm(&self.btm, query, None)
     }
 
@@ -1014,7 +1124,7 @@ impl SpaceMut for MorkSpace {
             if atom.iter().filter_type::<&VariableAtom>().next().is_some() {
                 self.var_free = false;
             }
-            self.mutation_gen += 1;
+            self.update_column_indexes(&bytes, true);
             self.kernel.btm.insert(&bytes, ());
         } else {
             self.rejected_atoms += 1;
@@ -1030,7 +1140,7 @@ impl SpaceMut for MorkSpace {
         if encode_atom(atom, &mut vars, &mut bytes, &mut GroundedSink::ValueOnly).is_err() {
             return false;
         }
-        self.mutation_gen += 1;
+        self.update_column_indexes(&bytes, false);
         self.kernel.btm.remove(&bytes).is_some()
     }
 
@@ -1876,6 +1986,32 @@ mod tests {
             prop_assert_eq!(
                 projected_results(&routed, &qv),
                 projected_results(&reference, &qv)
+            );
+        }
+    }
+
+    /// A snapshot's carried (frozen) indexes must answer exactly like the
+    /// matcher over the same trie, for every query shape.
+    proptest! {
+        #[test]
+        fn snapshot_carried_indexes_equal_the_matcher(
+            atoms in prop::collection::vec(arb_ground_atom(), 0..14),
+            query in arb_atom(),
+        ) {
+            let vars = query_vars();
+            let query = gen_atom_to_atom(&query, &vars);
+            let qv = query_variables(&query);
+            let mut mork = MorkSpace::new();
+            for a in &atoms {
+                mork.add(gen_atom_to_atom(a, &vars));
+            }
+            // Warm the live space's index for this shape (if the route admits
+            // it), then snapshot: the snapshot carries the frozen index.
+            let _ = mork.query(&query);
+            let snap = mork.snapshot();
+            prop_assert_eq!(
+                projected_results(&snap.query(&query), &qv),
+                projected_results(&query_btm(&snap.btm, &query, None), &qv)
             );
         }
     }

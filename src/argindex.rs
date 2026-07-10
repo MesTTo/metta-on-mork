@@ -135,6 +135,20 @@ fn index_order(ncols: usize, pos: usize) -> Vec<usize> {
     new_order
 }
 
+/// The index key for one fact's argument bytes: its columns re-emitted with
+/// `pos` first and variables renumbered canonically. `None` when the bytes do
+/// not split into `ncols` columns. This is the unit of incremental index
+/// maintenance: one fact added or removed from the relation is one key
+/// inserted into or removed from each of its indexes.
+pub fn permuted_fact_key(args: &[u8], ncols: usize, pos: usize) -> Option<Vec<u8>> {
+    let cols = split_columns(args, ncols);
+    if cols.len() != ncols {
+        return None;
+    }
+    let items = columns_to_items(&cols);
+    Some(emit_reordered(&items, &index_order(ncols, pos)))
+}
+
 /// Build an argument-position index for one relation column.
 pub fn build_arg_index(
     map: &PathMap<()>,
@@ -144,16 +158,12 @@ pub fn build_arg_index(
 ) -> PathMap<()> {
     debug_assert!(pos < ncols);
 
-    let new_order = index_order(ncols, pos);
     let mut index = PathMap::<()>::new();
     let mut rz = map.read_zipper_at_path(functor_prefix);
     while rz.to_next_val() {
-        let cols = split_columns(rz.path(), ncols);
-        if cols.len() != ncols {
-            continue;
+        if let Some(key) = permuted_fact_key(rz.path(), ncols, pos) {
+            index.insert(key, ());
         }
-        let items = columns_to_items(&cols);
-        index.insert(emit_reordered(&items, &new_order), ());
     }
     index
 }
