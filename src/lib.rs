@@ -151,6 +151,15 @@ pub struct MorkSpace {
     common: SpaceCommon,
     grounded: GroundedRegistry,
     rejected_atoms: usize,
+    /// One-way latch: true while every stored atom is variable-free. Byte-level
+    /// fast paths (the factorized conjunctive count) match by trie prefix and
+    /// cannot see a stored variable unifying with a pattern position (a bare
+    /// `$x` fact matches *any* factor, which a prefix seek returns zero for),
+    /// so they are admitted only while this holds. Cleared by a variable-bearing
+    /// `add`, by `add_sexpr_text` whose text can parse variables, and by `step`
+    /// (whose templates may write variables); never re-set, so a ground
+    /// relational store keeps its fast paths for its whole life.
+    var_free: bool,
 }
 
 impl MorkSpace {
@@ -161,6 +170,7 @@ impl MorkSpace {
             common: SpaceCommon::default(),
             grounded: GroundedRegistry::default(),
             rejected_atoms: 0,
+            var_free: true,
         }
     }
 
@@ -185,6 +195,9 @@ impl MorkSpace {
     /// Bulk-loads atoms from an S-expression source (whitespace-separated atoms)
     /// through MORK's parser. Convenient for large loads.
     pub fn add_sexpr_text(&mut self, text: &str) -> Result<usize, String> {
+        if text.as_bytes().contains(&b'$') {
+            self.var_free = false;
+        }
         self.kernel.add_all_sexpr(text.as_bytes())
     }
 
@@ -228,6 +241,9 @@ impl MorkSpace {
     /// through the worst-case-optimal leapfrog join; `factorized-aggregate` runs
     /// COUNT/SUM/MIN/MAX/AND sinks without enumerating the join.
     pub fn step(&mut self, steps: usize) -> usize {
+        if steps > 0 {
+            self.var_free = false;
+        }
         self.kernel.metta_calculus(steps)
     }
 
@@ -242,6 +258,7 @@ impl MorkSpace {
     pub fn snapshot(&self) -> MorkSnapshot {
         MorkSnapshot {
             btm: self.kernel.btm.clone(),
+            var_free: self.var_free,
         }
     }
 }
@@ -384,6 +401,9 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
 /// (e.g. `Arc<MorkSnapshot>`) for concurrent queries.
 pub struct MorkSnapshot {
     btm: PathMap<()>,
+    /// Carried var-freeness latch (see [`MorkSpace`]): gates the byte-level
+    /// fast paths on this snapshot.
+    var_free: bool,
 }
 
 /// A query pattern encoded once for repeated execution, so the per-query encode (the
@@ -409,10 +429,18 @@ impl MorkSnapshot {
     /// Counts atoms matching `query` through the trie read path only, without decoding
     /// bindings. Isolates the read-traversal cost from the per-result decode + `Bindings`
     /// allocation, so the two can be compared under parallel load.
+    ///
+    /// With the `factorized-aggregate` feature, a conjunctive count folds the join
+    /// in O(N^fhtw) instead of enumerating it (see [`factorized_count`]).
     pub fn count_matches(&self, query: &Atom) -> usize {
         let Some((mut wrapped, _vars, _refs)) = wrap_pattern(query) else {
             return 0;
         };
+        if self.var_free {
+            if let Some(count) = factorized_count(&self.btm, &wrapped) {
+                return count;
+            }
+        }
         let pat_expr = Expr {
             ptr: wrapped.as_mut_ptr(),
         };
@@ -433,6 +461,11 @@ impl MorkSnapshot {
     /// pattern without mutating it (the FFI bridge runs a prepared count many times over one
     /// handle), so the bytes are reused across calls; hold one `PreparedQuery` per thread.
     pub fn count_prepared(&self, prepared: &PreparedQuery) -> usize {
+        if self.var_free {
+            if let Some(count) = factorized_count(&self.btm, &prepared.wrapped) {
+                return count;
+            }
+        }
         let pat_expr = Expr {
             ptr: prepared.wrapped.as_ptr() as *mut u8,
         };
@@ -443,6 +476,39 @@ impl MorkSnapshot {
     pub fn len(&self) -> usize {
         self.btm.val_count()
     }
+}
+
+/// Counts a conjunctive query's join by factorized aggregation instead of
+/// enumeration: parse the encoded `(, f1 .. fn)` body into factors, decompose
+/// their hypergraph, and fold counts up the join tree -- O(N^fhtw) where
+/// enumeration is O(join output) (fac17's asymptotic win; a two-factor product
+/// join counts in linear time while its output is quadratic). Counting matches
+/// keeps every variable, so fac18's full-projection condition holds by
+/// construction, and there is no grouping template (fac20). Requires the
+/// `factorized-aggregate` feature and at least two factors (a single factor
+/// already counts in O(matches)); on any decline (`None`) the caller runs the
+/// enumerating count, whose answer is byte-identical (the kernel's
+/// factorized-aggregate fuzz differential, re-checked here against the
+/// enumerating count in this crate's proptest suite).
+fn factorized_count(btm: &PathMap<()>, wrapped: &[u8]) -> Option<usize> {
+    if !cfg!(feature = "factorized-aggregate") {
+        return None;
+    }
+    let (factors, nvars) = mork::zipper_join::parse_body_factors(wrapped)?;
+    if factors.len() < 2 {
+        return None;
+    }
+    // The aggregate fold materializes variable values per top-level column; a
+    // variable nested inside a compound column never materializes one (the
+    // kernel's bag-key encoder panics on exactly that shape), so admit only
+    // factors whose every column is a top-level variable or fully ground.
+    if factors
+        .iter()
+        .any(|f| f.cols.iter().any(|c| c.is_nonground_compound()))
+    {
+        return None;
+    }
+    mork::ghd::ghd_aggregate_auto::<u64>(btm, &factors, nvars, |_| 1).map(|c| c as usize)
 }
 
 /// Returns the conjuncts of a top-level `(, q1 .. qn)` query (hyperon-space's
@@ -812,6 +878,9 @@ impl SpaceMut for MorkSpace {
         // (State) by identity into `self.grounded` as it walks the atom.
         let mut sink = GroundedSink::Store(&mut self.grounded);
         if encode_atom(&atom, &mut vars, &mut bytes, &mut sink).is_ok() {
+            if atom.iter().filter_type::<&VariableAtom>().next().is_some() {
+                self.var_free = false;
+            }
             self.kernel.btm.insert(&bytes, ());
         } else {
             self.rejected_atoms += 1;
@@ -1595,6 +1664,89 @@ mod tests {
                 projected_results(&mork.query(&query), &qv),
                 projected_results(&ground.query(&query), &qv)
             );
+        }
+    }
+
+    /// The counterexample that forced the var-freeness latch: a bare-variable
+    /// fact unifies with any factor, but the factorized fold's prefix seek
+    /// cannot see it (it counted 0 where the matcher counts 1). Pinned so the
+    /// latch never silently loosens.
+    #[cfg(feature = "factorized-aggregate")]
+    #[test]
+    fn schematic_store_stays_on_the_enumerating_count() {
+        let mut space = MorkSpace::new();
+        space.add(Atom::var("anything"));
+        let query = Atom::expr([
+            Atom::sym(","),
+            Atom::expr([Atom::sym("s")]),
+            Atom::expr([Atom::sym("s")]),
+        ]);
+        assert_eq!(space.snapshot().count_matches(&query), 1);
+    }
+
+    /// On a variable-free store the factorized path is admitted and must agree
+    /// with the enumerating count exactly.
+    #[cfg(feature = "factorized-aggregate")]
+    proptest! {
+        #[test]
+        fn factorized_count_matches_the_enumerating_count_on_ground_stores(
+            atoms in prop::collection::vec(arb_ground_atom(), 0..14),
+            conj in prop::collection::vec(arb_atom(), 2..4),
+        ) {
+            let vars = query_vars();
+            let mut mork = MorkSpace::new();
+            for a in &atoms {
+                mork.add(gen_atom_to_atom(a, &vars));
+            }
+            let mut children = vec![Atom::sym(",")];
+            children.extend(conj.iter().map(|c| gen_atom_to_atom(c, &vars)));
+            let query = Atom::expr(children);
+
+            let snap = mork.snapshot();
+            let routed = snap.count_matches(&query);
+
+            let reference = match wrap_pattern(&query) {
+                None => 0,
+                Some((mut wrapped, _v, _r)) => {
+                    let pat_expr = Expr { ptr: wrapped.as_mut_ptr() };
+                    MorkKernel::query_multi(&snap.btm, pat_expr, |_res, _loc| true)
+                }
+            };
+
+            prop_assert_eq!(routed, reference);
+        }
+    }
+
+    /// The schematic-store differential: variable-bearing stores must fall back
+    /// to the enumerating count (the latch), keeping counts exact everywhere.
+    #[cfg(feature = "factorized-aggregate")]
+    proptest! {
+        #[test]
+        fn factorized_count_matches_the_enumerating_count(
+            atoms in prop::collection::vec(arb_atom(), 0..14),
+            conj in prop::collection::vec(arb_atom(), 2..4),
+        ) {
+            let vars = query_vars();
+            let mut mork = MorkSpace::new();
+            for a in &atoms {
+                mork.add(gen_atom_to_atom(a, &vars));
+            }
+            let mut children = vec![Atom::sym(",")];
+            children.extend(conj.iter().map(|c| gen_atom_to_atom(c, &vars)));
+            let query = Atom::expr(children);
+
+            let snap = mork.snapshot();
+            let routed = snap.count_matches(&query);
+
+            let reference = match wrap_pattern(&query) {
+                None => 0,
+                Some((mut wrapped, _v, _r)) => {
+                    let pat_expr = Expr { ptr: wrapped.as_mut_ptr() };
+                    MorkKernel::query_multi(&snap.btm, pat_expr, |_res, _loc| true)
+                }
+            };
+
+            prop_assert_eq!(routed, reference);
         }
     }
 }
