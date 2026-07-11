@@ -92,7 +92,7 @@ The scan grows linearly; the steady indexed query does not grow at all. The one 
 (one O(1) permuted-key update per add/remove of the relation's facts) instead of invalidating
 it, so interleaved add/query workloads keep seeking. Snapshots carry the fresh indexes as
 copy-on-write clones: a `Send + Sync` `MorkSnapshot` answers the same selective query in
-~730 ns at every measured N, so parallel workers seek too.
+~780 ns at every measured N, so parallel workers seek too.
 
 ### Conjunctive counts never enumerate the join
 
@@ -126,9 +126,9 @@ answers, not the store. The worst-case shape is a variable-functor pattern
 
 | N | first call (scan + fill) | tabled replay | ratio |
 |---|---|---|---|
-| 100,000 | 3.12 ms | 1.68 µs | 1,855× |
-| 400,000 | 11.5 ms | 1.68 µs | 6,834× |
-| 1,600,000 | 45.7 ms | 1.99 µs | 22,981× |
+| 100,000 | 3.38 ms | 1.66 µs | 2,036× |
+| 400,000 | 10.7 ms | 1.66 µs | 6,446× |
+| 1,600,000 | 42.1 ms | 1.66 µs | 25,357× |
 
 Unlike the byte-seek paths, tabling needs no var-freeness latch: the replayed
 rows are the unifier's own output, schematic data included. Conjunctive
@@ -236,6 +236,55 @@ family: the respawned rules bake fresh ground constants each round, so every
 round's rule is genuinely new and its correct delta is the full input; measured
 1.09x at forward depth 4 and nothing on `bfc-xp.mm2`.
 
+## The whole chaining repository, differentially
+
+Every one of the 121 `.metta` programs in trueagi-io/chaining runs on MorkSpace as
+the interpreter's `&self` (`cargo run --release -p mork-demo --example
+chaining_sweep -- <file.metta> mork` in hyperon-experimental), and a sweep compares
+each against a stock GroundingSpace run of the same file. Comparison is tiered so
+every claim says exactly how strong the equivalence is; the alpha tier parses each
+result atom, assert-error contents included, and renumbers variables by first
+preorder occurrence, so coreference topology counts (the definition
+MeTTa-Compiler's `atoms_are_alpha_equivalent` uses):
+
+| tier | files | meaning |
+|---|---|---|
+| byte-identical stdout | 47 | nothing differs |
+| space Display name only | 61 | `MorkSpace(0 atoms)` vs `GroundingSpace-top` inside error text |
+| structural alpha | 9 | same result multisets up to variable naming and set order |
+| trace order | 2 | same per-line trace multiset; nondeterministic-search print order differs |
+| timeout on both at 90 s | 1 | proven equal at a 590 s cap |
+| open | 1 | `pc-bc-fa`, below |
+
+The sweep drove three fixes to the query path. Decode was rebuilding captured
+expressions as fresh atoms, losing hyperon's `is_evaluated` flag, so the
+interpreter re-entered evaluated results as calls; encode now records evaluated
+query-subexpression spans and decode restores the flag. Result rows now sort by a
+specificity key (longer exact-byte agreement with the pattern first, the order
+GroundingSpace's trie yields by exploring exact branches before variable ones),
+which also brought four heavy inference-control searches that previously timed out
+only on MorkSpace under the cap. And results are narrowed to the query's own
+variables through hyperon's `match_atoms`, GroundingSpace's own pipeline, so
+stored-fact helper variables cannot leak into recursive interpreter bindings.
+
+Two boundaries are deliberate. Equal-specificity result order is trie order, not
+insertion order: a set-semantics trie has no insertion history, and the sidecar
+that tracked one measured a 16x parallel-load regression for an ordering MeTTa
+leaves unspecified. And `pc-bc-fa` stays open because its reference is not
+well-defined: two fresh GroundingSpace processes disagree with each other on 8 of
+its 69 proofs (upstream `Bindings::narrow_vars` picks equality-class
+representatives while iterating `HashSet`s), and MorkSpace's difference against
+one grounding run sits in that same noise class, with proof counts agreeing.
+
+The narrowing and ordering work costs the matcher decode path about half a
+microsecond on a warm point query (~4.2 µs, against GroundingSpace's ~16 µs) and
+nothing anywhere else: ground fact spans skip the rematch, all-ground rows skip
+the narrow, the latch-guarded index route never narrows, and the sort key is
+built only when two or more rows need ordering. The column-index seek holds at
+768 ns steady (80,240x over the scan at 1.6M), tabled replay at 1.66 µs, the
+shared-space parallel query at 1.06 µs at 16 threads, and the 1M-atom parallel
+load at 16 ms.
+
 ## Against stock GroundingSpace
 
 Same workload (load N `(edge nK nK+1)` atoms, then a point query), measured back to back
@@ -244,10 +293,12 @@ Same workload (load N `(edge nK nK+1)` atoms, then a point query), measured back
 
 | N | load (Grounding → Mork) | point query (Grounding → Mork warm) |
 |---|---|---|
-| 100,000 | 114 ms → **12.7 ms** | ~16 µs → **~3.7 µs** |
-| 500,000 | 935 ms → **67.4 ms** | ~16 µs → **~3.7 µs** |
+| 100,000 | 114 ms → **13.7 ms** | ~16 µs → **~4.2 µs** |
+| 500,000 | 935 ms → **69.1 ms** | ~16 µs → **~4.2 µs** |
 
-Load is 9–14× faster and a warm point query about 4×; a 1M-atom load lands in 154 ms. A cold
+Load is 8–14× faster and a warm point query about 4× (the half-microsecond over the
+earlier 3.7 µs is the matched-fact span capture the variable-leak fix needs); a 1M-atom
+load lands in 154 ms sequential, 16 ms across 16 threads. A cold
 first query (a shape MORK has not seen) is ~30 µs against GroundingSpace's ~16 µs, both flat
 in N.
 
@@ -256,10 +307,10 @@ in N.
 `MorkSpace` itself is now `Send + Sync` (a compile-time assertion in the test suite): one
 live space object is shared by plain reference across threads — no snapshots, no clones.
 `cargo run --release --example shared_space_parallel` alternates trie-descent point queries
-and column-index seeks from every thread against the same space: 2.75 µs/query at 1 thread
-to 1.00 µs/query at 16 threads (320,000 queries, every result asserted). `MorkSnapshot`
+and column-index seeks from every thread against the same space: 3.2 µs/query at 1 thread
+to 1.06 µs/query at 16 threads (320,000 queries, every result asserted). `MorkSnapshot`
 remains the frozen-view option (`--example parallel_query`), carrying the column indexes for
-~730 ns seeks. Matcher-path thread scaling is sublinear because the upstream kernel keeps
+~780 ns seeks. Matcher-path thread scaling is sublinear because the upstream kernel keeps
 process-global matcher counters that all threads write; the private fork's per-thread
 accumulation is not yet in any upstream PR.
 
