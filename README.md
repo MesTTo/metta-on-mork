@@ -208,21 +208,28 @@ kernel and this crate agree exactly.
 Backward chaining emulated by forward chaining, `bfc-xp.mm2`, is the case the
 chaining repo measured MM2 losing to PeTTa by 290x and set aside as too slow. The
 flat guarded join bodies in its expansion rules (`sol x decFn x lte`) are exactly
-what the `leapfrog` feature routes when `MORK_LEAPFROG=all`:
+what the leapfrog join seeks, but the kernel's dispatch policy required a cyclic
+body and declined them; measuring this suite exposed the gap, and the integration
+kernel now admits an acyclic multiway body whose large factor a bounded-small
+factor guards through a shared whole column (`leapfrog-acyclic-guard`), so the
+`leapfrog` feature routes these by default, no knob:
 
-| target | upstream quote (their Xeon) | here, default policy | here, `MORK_LEAPFROG=all` | PeTTa `obc`, local |
+| target | upstream quote (their Xeon) | unrouted product | routed (the default now) | PeTTa `obc`, local |
 |---|---|---|---|---|
-| jarr (size 13) | 40.4 s | 17.1 s | **145 ms** | 0.13 s |
-| imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **863 ms** | 0.17 s |
+| jarr (size 13) | 40.4 s | 17.1 s | **140 ms** | 0.13 s |
+| imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **875 ms** | 0.17 s |
 
 Both engines find the same proofs (two for jarr, one for imim1), the routed and
 unrouted space dumps are byte-identical, and the kernel's own counters show where
-the 117x on jarr comes from: 220,380,293 transitions collapse to 29,969. The knob
-is directional, not free: on the pure-enumeration `pc-fc.mm2` depth 3 it costs
-1.4x (26 ms to 37 ms), identical outputs either way. Semi-naive stepping cannot
-help this program family at all, because the programs respawn their exec rules
-under a fresh location every round and a per-rule frontier has no history for a
-new rule; measured 1.09x at forward depth 4 and nothing on `bfc-xp.mm2`.
+the 117x on jarr comes from: 220,380,293 transitions collapse to about 30,000.
+The whole-column requirement on both sides of the guard is what keeps the routing
+directional: `pc-fc.mm2`'s single-fact rule base shares its variables only inside
+nonground compounds, so its enumeration-shaped bodies stay on the product path
+(depth 3 holds at 26 ms, where forcing them through the join with
+`MORK_LEAPFROG=all` costs 1.4x). Semi-naive stepping cannot help this program
+family: the respawned rules bake fresh ground constants each round, so every
+round's rule is genuinely new and its correct delta is the full input; measured
+1.09x at forward depth 4 and nothing on `bfc-xp.mm2`.
 
 ## Against stock GroundingSpace
 
