@@ -102,6 +102,78 @@ fn ground_prefix_len(bytes: &[u8]) -> usize {
     pos
 }
 
+fn skip_encoded_atom(bytes: &[u8], pos: &mut usize) -> Option<()> {
+    let tag = byte_item(*bytes.get(*pos)?);
+    *pos += 1;
+    match tag {
+        Tag::SymbolSize(size) => {
+            *pos = (*pos).checked_add(size as usize)?;
+            bytes.get(..*pos)?;
+        }
+        Tag::Arity(k) => {
+            for _ in 0..k {
+                skip_encoded_atom(bytes, pos)?;
+            }
+        }
+        Tag::NewVar | Tag::VarRef(_) => {}
+    }
+    Some(())
+}
+
+fn push_specificity_key(pattern: &[u8], p: &mut usize, fact: &[u8], f: &mut usize, out: &mut Vec<u8>) -> Option<()> {
+    let p_start = *p;
+    let f_start = *f;
+    let p_tag = byte_item(*pattern.get(*p)?);
+    let f_tag = byte_item(*fact.get(*f)?);
+    if matches!(p_tag, Tag::NewVar | Tag::VarRef(_)) {
+        out.push(if matches!(f_tag, Tag::NewVar | Tag::VarRef(_)) {
+            0
+        } else {
+            1
+        });
+        *p += 1;
+        skip_encoded_atom(fact, f)?;
+        return Some(());
+    }
+    if matches!(f_tag, Tag::NewVar | Tag::VarRef(_)) {
+        out.push(1);
+        skip_encoded_atom(pattern, p)?;
+        *f += 1;
+        return Some(());
+    }
+    out.push(0);
+    *p += 1;
+    *f += 1;
+    match (p_tag, f_tag) {
+        (Tag::SymbolSize(p_size), Tag::SymbolSize(f_size)) => {
+            *p = (*p).checked_add(p_size as usize)?;
+            *f = (*f).checked_add(f_size as usize)?;
+            pattern.get(p_start..*p)?;
+            fact.get(f_start..*f)?;
+        }
+        (Tag::Arity(p_arity), Tag::Arity(f_arity)) if p_arity == f_arity => {
+            for _ in 0..p_arity {
+                push_specificity_key(pattern, p, fact, f, out)?;
+            }
+        }
+        _ => {
+            *p = p_start;
+            *f = f_start;
+            skip_encoded_atom(pattern, p)?;
+            skip_encoded_atom(fact, f)?;
+        }
+    }
+    Some(())
+}
+
+fn specificity_key(pattern: &[u8], fact: &[u8]) -> Vec<u8> {
+    let mut p = 0usize;
+    let mut f = 0usize;
+    let mut key = Vec::new();
+    let _ = push_specificity_key(pattern, &mut p, fact, &mut f, &mut key);
+    key
+}
+
 /// Whether `atom` holds a mutable grounded value anywhere in its tree: such
 /// atoms need the space's identity registry at encode time.
 fn contains_mutable_grounded(atom: &Atom) -> bool {
@@ -177,6 +249,28 @@ impl GroundedRegistry {
     }
 }
 
+#[derive(Default)]
+struct EvaluatedSpans {
+    spans: Vec<Vec<u8>>,
+}
+
+impl EvaluatedSpans {
+    fn insert(&mut self, span: &[u8]) {
+        self.spans.push(span.to_vec());
+    }
+
+    fn contains(&self, span: &[u8]) -> bool {
+        self.spans.iter().any(|recorded| recorded == span)
+    }
+}
+
+struct WrappedPattern {
+    bytes: Vec<u8>,
+    vars: Vec<VariableAtom>,
+    refs: Vec<(usize, Atom)>,
+    evaluated: EvaluatedSpans,
+}
+
 /// Decode-time state: the namespace these bytes belong to (so variables are named by
 /// `(namespace, index)` and a data variable can't collide with a pattern variable), a
 /// running counter for first-occurrence variables, the optional grounded registry, and
@@ -189,6 +283,7 @@ struct DecodeCtx<'a> {
     var_counter: usize,
     grounded: Option<&'a GroundedRegistry>,
     query_vars: &'a [VariableAtom],
+    evaluated: Option<&'a EvaluatedSpans>,
     /// Globally unique id stamped on every data variable decoded for one query result,
     /// so two results (or two separate query calls, e.g. recursion levels) never produce
     /// the same `VariableAtom` and alias when the interpreter threads their bindings.
@@ -335,7 +430,7 @@ impl MorkSpace {
         if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
             return BindingsSet::single();
         }
-        let Some((wrapped, vars, refs)) = wrap_pattern(query) else {
+        let Some(pattern) = wrap_pattern(query) else {
             return BindingsSet::empty();
         };
         let mut reg = self.grounded.clone();
@@ -347,22 +442,34 @@ impl MorkSpace {
         let gen = self.mutation_gen;
         {
             let cache = self.query_cache.read().unwrap();
-            if let Some((rows, g)) = cache.get(&wrapped) {
+            if let Some((rows, g)) = cache.get(&pattern.bytes) {
                 if *g == gen {
-                    return rows_to_bindings(rows, &vars, &refs, &reg);
+                    return rows_to_bindings(
+                        rows,
+                        &pattern.vars,
+                        &pattern.refs,
+                        &reg,
+                        &pattern.evaluated,
+                    );
                 }
             }
         }
         let fill_started = std::time::Instant::now();
-        let rows = query_btm_rows(&self.kernel.btm, &wrapped);
+        let rows = query_btm_rows(&self.kernel.btm, &pattern.bytes);
         let fill_cost = fill_started.elapsed();
         if worth_tabling(fill_cost, rows.len()) {
             let mut cache = self.query_cache.write().unwrap();
-            if cache.len() < QUERY_CACHE_MAX_ENTRIES || cache.contains_key(&wrapped) {
-                cache.insert(wrapped, (rows.clone(), gen));
+            if cache.len() < QUERY_CACHE_MAX_ENTRIES || cache.contains_key(&pattern.bytes) {
+                cache.insert(pattern.bytes.clone(), (rows.clone(), gen));
             }
         }
-        rows_to_bindings(&rows, &vars, &refs, &reg)
+        rows_to_bindings(
+            &rows,
+            &pattern.vars,
+            &pattern.refs,
+            &reg,
+            &pattern.evaluated,
+        )
     }
 
     /// Incrementally maintains the fresh column indexes across one mutation:
@@ -903,9 +1010,9 @@ fn classify_index_route(
     if conjuncts(query).is_some() {
         return None;
     }
-    let (wrapped, vars, refs) = wrap_pattern(query)?;
+    let pattern = wrap_pattern(query)?;
     // Strip the `(, ...)` wrapper: Arity(2) + SymbolSize(1) + b','.
-    let classified = argindex::classify_single_factor(&wrapped[3..])?;
+    let classified = argindex::classify_single_factor(&pattern.bytes[3..])?;
     if matches!(
         classified.args.first(),
         Some(argindex::ArgClass::Bound(_))
@@ -922,7 +1029,7 @@ fn classify_index_route(
             argindex::ArgClass::Free => None,
         })
         .max_by_key(|(_, v)| v.len())?;
-    Some((classified, pos, value, vars, refs))
+    Some((classified, pos, value, pattern.vars, pattern.refs))
 }
 
 /// Turns the facts an index seek returned into the matcher-identical
@@ -965,6 +1072,7 @@ fn indexed_facts_to_bindings(
                         var_counter: 0,
                         grounded: Some(&reg),
                         query_vars: vars,
+                        evaluated: None,
                         result_id,
                     };
                     let Some(atom) = decode_atom(cols[i], &mut posn, &mut ctx) else {
@@ -1000,10 +1108,18 @@ struct RawBinding {
     env_v: u8,
 }
 
-/// One raw match: the kernel unifier's bindings in `BTreeMap` iteration order.
+/// One raw match: the kernel unifier's bindings in `BTreeMap` iteration order,
+/// plus the sort key that makes result order deterministic and Grounding-like:
+/// more specific facts (longer exact-byte agreement with the pattern) come
+/// first, and equal-specificity rows keep the kernel's trie order. Insertion
+/// order is NOT recovered: a set-semantics trie has no insertion history, and a
+/// sidecar that tracks one measured a 16x bulk-load regression for an ordering
+/// MeTTa leaves unspecified.
 #[derive(Clone)]
 struct RawRow {
     entries: Vec<RawBinding>,
+    specificity: Vec<u8>,
+    sequence: usize,
 }
 
 /// Runs the kernel matcher and captures every match as a [`RawRow`]. `wrapped`
@@ -1013,22 +1129,36 @@ fn query_btm_rows(btm: &PathMap<()>, wrapped: &[u8]) -> Vec<RawRow> {
     let pat_expr = Expr {
         ptr: wrapped.as_ptr() as *mut u8,
     };
+    let pattern_factor = wrapped.get(3..).unwrap_or(wrapped);
     let mut rows = Vec::new();
-    MorkKernel::query_multi(btm, pat_expr, |res, _loc| {
+    MorkKernel::query_multi(btm, pat_expr, |res, loc| {
         let Err(bindings) = res else { return true };
+        let loc_span = unsafe { loc.span().as_ref() };
+        let specificity = loc_span
+            .map(|span| specificity_key(pattern_factor, span))
+            .unwrap_or_default();
+        let sequence = rows.len();
+        let entries = bindings
+            .iter()
+            .map(|(&(key_ns, key_idx), env)| RawBinding {
+                key_ns,
+                key_idx,
+                span: unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec(),
+                env_n: env.n,
+                env_v: env.v,
+            })
+            .collect::<Vec<_>>();
         rows.push(RawRow {
-            entries: bindings
-                .iter()
-                .map(|(&(key_ns, key_idx), env)| RawBinding {
-                    key_ns,
-                    key_idx,
-                    span: unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec(),
-                    env_n: env.n,
-                    env_v: env.v,
-                })
-                .collect(),
+            entries,
+            specificity,
+            sequence,
         });
         true
+    });
+    rows.sort_by(|a, b| {
+        a.specificity
+            .cmp(&b.specificity)
+            .then_with(|| a.sequence.cmp(&b.sequence))
     });
     rows
 }
@@ -1045,6 +1175,7 @@ fn rows_to_bindings(
     vars: &[VariableAtom],
     refs: &[(usize, Atom)],
     reg: &GroundedRegistry,
+    query_evaluated: &EvaluatedSpans,
 ) -> BindingsSet {
     let mut set = BindingsSet::empty();
     for row in rows {
@@ -1076,6 +1207,7 @@ fn rows_to_bindings(
                 grounded: Some(reg),
                 ns: b.env_n,
                 query_vars: vars,
+                evaluated: (b.env_n == 0).then_some(query_evaluated),
                 result_id,
             };
             let Some(atom) = decode_atom(&b.span, &mut pos, &mut ctx) else {
@@ -1108,7 +1240,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
     if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
         return BindingsSet::single();
     }
-    let Some((wrapped, vars, refs)) = wrap_pattern(query) else {
+    let Some(pattern) = wrap_pattern(query) else {
         return BindingsSet::empty();
     };
     // Decode must recover grounded atoms that appear in the query itself (the `4` in
@@ -1117,8 +1249,14 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
     // cannot reduce. Merge the query's grounded atoms with the space registry here.
     let mut reg = grounded.cloned().unwrap_or_default();
     reg.register(query);
-    let rows = query_btm_rows(btm, &wrapped);
-    rows_to_bindings(&rows, &vars, &refs, &reg)
+    let rows = query_btm_rows(btm, &pattern.bytes);
+    rows_to_bindings(
+        &rows,
+        &pattern.vars,
+        &pattern.refs,
+        &reg,
+        &pattern.evaluated,
+    )
 }
 
 /// A `Send + Sync` read-only snapshot of a space's atoms (a copy-on-write clone of
@@ -1148,6 +1286,8 @@ pub struct PreparedQuery {
     vars: Vec<VariableAtom>,
     #[allow(dead_code)]
     refs: Vec<(usize, Atom)>,
+    #[allow(dead_code)]
+    evaluated: EvaluatedSpans,
 }
 
 impl MorkSnapshot {
@@ -1191,16 +1331,16 @@ impl MorkSnapshot {
     /// With the `factorized-aggregate` feature, a conjunctive count folds the join
     /// in O(N^fhtw) instead of enumerating it (see [`factorized_count`]).
     pub fn count_matches(&self, query: &Atom) -> usize {
-        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(query) else {
+        let Some(mut pattern) = wrap_pattern(query) else {
             return 0;
         };
         if self.var_free {
-            if let Some(count) = factorized_count(&self.btm, &wrapped) {
+            if let Some(count) = factorized_count(&self.btm, &pattern.bytes) {
                 return count;
             }
         }
         let pat_expr = Expr {
-            ptr: wrapped.as_mut_ptr(),
+            ptr: pattern.bytes.as_mut_ptr(),
         };
         MorkKernel::query_multi(&self.btm, pat_expr, |_res, _loc| true)
     }
@@ -1211,8 +1351,13 @@ impl MorkSnapshot {
     /// (`prepare_count` / `count_prepared`): hoist the encode out of the hot loop. Returns
     /// `None` for an unencodable pattern (symbol/arity over 63).
     pub fn prepare(&self, query: &Atom) -> Option<PreparedQuery> {
-        let (wrapped, vars, refs) = wrap_pattern(query)?;
-        Some(PreparedQuery { wrapped, vars, refs })
+        let pattern = wrap_pattern(query)?;
+        Some(PreparedQuery {
+            wrapped: pattern.bytes,
+            vars: pattern.vars,
+            refs: pattern.refs,
+            evaluated: pattern.evaluated,
+        })
     }
 
     /// Counts matches of a [`PreparedQuery`] reusing its encoded bytes. The kernel reads the
@@ -1293,9 +1438,10 @@ fn conjuncts(query: &Atom) -> Option<&[Atom]> {
 /// variable the kernel's worst-case-optimal join matches natively, instead of the
 /// per-conjunct query-and-thread loop (and its intermediate-product blowup) that
 /// an interpreter-side conjunction costs.
-fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize, Atom)>)> {
+fn wrap_pattern(query: &Atom) -> Option<WrappedPattern> {
     let mut vars = Vec::new();
     let mut refs = Vec::new();
+    let mut evaluated = EvaluatedSpans::default();
     let mut wrapped = Vec::with_capacity(64);
     let mut sink = GroundedSink::Query(&mut refs);
     match conjuncts(query) {
@@ -1309,7 +1455,15 @@ fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize,
             wrapped.push(item_byte(Tag::SymbolSize(1)));
             wrapped.push(b',');
             for q in qs {
-                if encode_atom(q, &mut vars, &mut wrapped, &mut sink).is_err() {
+                if encode_atom_collecting_evaluated(
+                    q,
+                    &mut vars,
+                    &mut wrapped,
+                    &mut sink,
+                    &mut evaluated,
+                )
+                .is_err()
+                {
                     return None;
                 }
             }
@@ -1318,12 +1472,25 @@ fn wrap_pattern(query: &Atom) -> Option<(Vec<u8>, Vec<VariableAtom>, Vec<(usize,
             wrapped.push(item_byte(Tag::Arity(2)));
             wrapped.push(item_byte(Tag::SymbolSize(1)));
             wrapped.push(b',');
-            if encode_atom(query, &mut vars, &mut wrapped, &mut sink).is_err() {
+            if encode_atom_collecting_evaluated(
+                query,
+                &mut vars,
+                &mut wrapped,
+                &mut sink,
+                &mut evaluated,
+            )
+            .is_err()
+            {
                 return None;
             }
         }
     }
-    Some((wrapped, vars, refs))
+    Some(WrappedPattern {
+        bytes: wrapped,
+        vars,
+        refs,
+        evaluated,
+    })
 }
 
 /// A hash-prefix-sharded MORK space for data-parallel whole-space sweeps -- the
@@ -1391,12 +1558,12 @@ impl ShardedMorkSpace {
     /// Counts atoms matching `pattern`, sweeping every shard in parallel (rayon).
     pub fn par_count_matches(&self, pattern: &Atom) -> usize {
         use rayon::prelude::*;
-        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(pattern) else {
+        let Some(mut pattern) = wrap_pattern(pattern) else {
             return 0;
         };
         // Pass the pattern-buffer address as a usize (Send) and rebuild the Expr in
         // each task; the buffer is alive for the whole sweep and read-only.
-        let pat_ptr = wrapped.as_mut_ptr() as usize;
+        let pat_ptr = pattern.bytes.as_mut_ptr() as usize;
         self.shards
             .par_iter()
             .map(|shard| {
@@ -1410,11 +1577,11 @@ impl ShardedMorkSpace {
 
     /// Sequential baseline of [`par_count_matches`].
     pub fn count_matches(&self, pattern: &Atom) -> usize {
-        let Some((mut wrapped, _vars, _refs)) = wrap_pattern(pattern) else {
+        let Some(mut pattern) = wrap_pattern(pattern) else {
             return 0;
         };
         let pat_expr = Expr {
-            ptr: wrapped.as_mut_ptr(),
+            ptr: pattern.bytes.as_mut_ptr(),
         };
         self.shards
             .iter()
@@ -1454,6 +1621,16 @@ fn encode_atom(
     out: &mut Vec<u8>,
     sink: &mut GroundedSink,
 ) -> Result<(), ()> {
+    encode_atom_collecting_evaluated(atom, vars, out, sink, &mut EvaluatedSpans::default())
+}
+
+fn encode_atom_collecting_evaluated(
+    atom: &Atom,
+    vars: &mut Vec<VariableAtom>,
+    out: &mut Vec<u8>,
+    sink: &mut GroundedSink,
+    evaluated: &mut EvaluatedSpans,
+) -> Result<(), ()> {
     match atom {
         Atom::Symbol(s) => encode_symbol(s.name(), out),
         Atom::Grounded(g) if g.as_grounded().is_mutable() => match sink {
@@ -1483,9 +1660,13 @@ fn encode_atom(
             if children.len() > MAX_FIELD {
                 return Err(());
             }
+            let start = out.len();
             out.push(item_byte(Tag::Arity(children.len() as u8)));
             for child in children {
-                encode_atom(child, vars, out, sink)?;
+                encode_atom_collecting_evaluated(child, vars, out, sink, evaluated)?;
+            }
+            if e.is_evaluated() {
+                evaluated.insert(&out[start..]);
             }
             Ok(())
         }
@@ -1540,6 +1721,7 @@ fn encode_grounded_ref(id: u64, out: &mut Vec<u8>) -> Result<(), ()> {
 /// Walks MORK's preorder byte encoding back into a Hyperon `Atom`. `pos` advances
 /// past the consumed bytes. Returns `None` on a malformed/short buffer.
 fn decode_atom(bytes: &[u8], pos: &mut usize, ctx: &mut DecodeCtx) -> Option<Atom> {
+    let start = *pos;
     let tag = byte_item(*bytes.get(*pos)?);
     *pos += 1;
     match tag {
@@ -1577,7 +1759,16 @@ fn decode_atom(bytes: &[u8], pos: &mut usize, ctx: &mut DecodeCtx) -> Option<Ato
             for _ in 0..k {
                 children.push(decode_atom(bytes, pos, ctx)?);
             }
-            Some(Atom::expr(children))
+            let mut atom = Atom::expr(children);
+            if ctx
+                .evaluated
+                .is_some_and(|evaluated| evaluated.contains(&bytes[start..*pos]))
+            {
+                if let Atom::Expression(expr) = &mut atom {
+                    expr.set_evaluated();
+                }
+            }
+            Some(atom)
         }
         // The n-th introduced variable and its back-references share one name, so the
         // coreference in stored atoms like (-> (→ $p $q) $p $q) survives the round-trip.
@@ -1614,6 +1805,7 @@ impl Space for MorkSpace {
                 var_counter: 0,
                 grounded: Some(&self.grounded),
                 query_vars: &[],
+                evaluated: None,
                 result_id: next_variable_id(),
             };
             if let Some(atom) = decode_atom(atom_bytes, &mut pos, &mut ctx) {
@@ -1799,6 +1991,19 @@ mod tests {
         b.resolve(&VariableAtom::new(name))
     }
 
+    fn evaluated(atom: Atom) -> Atom {
+        let mut atom = atom;
+        match &mut atom {
+            Atom::Expression(expr) => expr.set_evaluated(),
+            _ => panic!("test helper only marks expressions as evaluated"),
+        }
+        atom
+    }
+
+    fn is_evaluated_expr(atom: &Atom) -> bool {
+        matches!(atom, Atom::Expression(expr) if expr.is_evaluated())
+    }
+
     #[derive(Clone, Debug)]
     enum GenAtom {
         Sym(u8),
@@ -1946,6 +2151,139 @@ mod tests {
     // atoms themselves are Send + Sync on the thread-safe hyperon base.
     assert_impl_all!(MorkSpace: Send, Sync);
 
+    #[test]
+    fn query_side_evaluated_expression_survives_variable_capture() {
+        let rule = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("id"), Atom::var("x")]),
+            Atom::var("x"),
+        ]);
+        let query_value = evaluated(Atom::expr([Atom::sym("value"), Atom::sym("a")]));
+        let query = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("id"), query_value]),
+            Atom::var("out"),
+        ]);
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        ground.add(rule.clone());
+        mork.add(rule);
+
+        let ground_results = ground.query(&query);
+        let mork_results = mork.query(&query);
+        assert_eq!(ground_results.len(), 1);
+        assert_eq!(mork_results.len(), 1);
+
+        let ground_out = resolve(ground_results.iter().next().unwrap(), "out").unwrap();
+        let mork_out = resolve(mork_results.iter().next().unwrap(), "out").unwrap();
+        assert!(is_evaluated_expr(&ground_out));
+        assert!(is_evaluated_expr(&mork_out));
+        assert_eq!(canonical_atom(&mork_out), canonical_atom(&ground_out));
+    }
+
+    /// The documented order boundary: for EQUAL-specificity facts, GroundingSpace
+    /// returns insertion order and MorkSpace returns trie byte order -- a
+    /// set-semantics trie has no insertion history, and a sidecar tracking one
+    /// measured a 16x bulk-load regression for an ordering MeTTa leaves
+    /// unspecified. The result SETS must agree, and MorkSpace's order must be
+    /// deterministic (stable across repeated queries).
+    #[test]
+    fn equal_specificity_order_is_trie_order_and_sets_agree() {
+        let first = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("choice"), Atom::var("x")]),
+            Atom::expr([Atom::sym("z"), Atom::var("x")]),
+        ]);
+        let second = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("choice"), Atom::var("x")]),
+            Atom::expr([Atom::sym("a"), Atom::var("x")]),
+        ]);
+        let query = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("choice"), Atom::sym("target")]),
+            Atom::var("out"),
+        ]);
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        for atom in [first, second] {
+            ground.add(atom.clone());
+            mork.add(atom);
+        }
+
+        let ground_results = ground
+            .query(&query)
+            .iter()
+            .map(|bindings| canonical_atom(&resolve(bindings, "out").unwrap()))
+            .collect::<Vec<_>>();
+        let mork_results = mork
+            .query(&query)
+            .iter()
+            .map(|bindings| canonical_atom(&resolve(bindings, "out").unwrap()))
+            .collect::<Vec<_>>();
+
+        // Grounding: insertion order. Mork: trie order ("a" before "z").
+        assert_eq!(ground_results, vec!["E(S(z) S(target))", "E(S(a) S(target))"]);
+        assert_eq!(mork_results, vec!["E(S(a) S(target))", "E(S(z) S(target))"]);
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(mork_results.clone()), sorted(ground_results));
+        let mork_again = mork
+            .query(&query)
+            .iter()
+            .map(|bindings| canonical_atom(&resolve(bindings, "out").unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(mork_again, mork_results, "mork order must be deterministic");
+    }
+
+    #[test]
+    fn query_results_follow_grounding_specificity_order() {
+        let generic = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("bce"), Atom::var("env"), Atom::var("depth"), Atom::expr([Atom::sym(":"), Atom::var("proof"), Atom::var("theorem")])]),
+            Atom::sym("generic"),
+        ]);
+        let modus_ponens = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("bce"), Atom::var("env"), Atom::expr([Atom::sym("S"), Atom::var("k")]), Atom::expr([Atom::sym(":"), Atom::expr([Atom::sym("ax-mp"), Atom::var("left"), Atom::var("right")]), Atom::var("theorem")])]),
+            Atom::sym("modus-ponens"),
+        ]);
+        let axiom = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("bce"), Atom::var("env"), Atom::var("depth"), Atom::expr([Atom::sym(":"), Atom::sym("ax-3"), Atom::var("theorem")])]),
+            Atom::sym("axiom"),
+        ]);
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        for atom in [generic, modus_ponens, axiom] {
+            ground.add(atom.clone());
+            mork.add(atom);
+        }
+
+        let mp_query = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("bce"), Atom::sym("env"), Atom::expr([Atom::sym("S"), Atom::sym("Z")]), Atom::expr([Atom::sym(":"), Atom::var("proof"), Atom::sym("goal")])]),
+            Atom::var("out"),
+        ]);
+        let ax_query = Atom::expr([
+            Atom::sym("="),
+            Atom::expr([Atom::sym("bce"), Atom::sym("env"), Atom::sym("Z"), Atom::expr([Atom::sym(":"), Atom::var("proof"), Atom::sym("goal")])]),
+            Atom::var("out"),
+        ]);
+        let ordered = |space: &dyn Space, query: &Atom| {
+            space
+                .query(query)
+                .iter()
+                .map(|bindings| canonical_atom(&resolve(bindings, "out").unwrap()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ordered(&mork, &mp_query), ordered(&ground, &mp_query));
+        assert_eq!(ordered(&mork, &ax_query), ordered(&ground, &ax_query));
+    }
+
     proptest! {
         #[test]
         fn binding_construction_never_emits_merge_panic(ops in prop::collection::vec(arb_binding_op(), 0..32)) {
@@ -1980,6 +2318,7 @@ mod tests {
                 var_counter: 0,
                 grounded: None,
                 query_vars: &[],
+                evaluated: None,
                 result_id: next_variable_id(),
             };
             let decoded = decode_atom(&bytes, &mut pos, &mut ctx);
@@ -2481,8 +2820,8 @@ mod tests {
 
             let reference = match wrap_pattern(&query) {
                 None => 0,
-                Some((mut wrapped, _v, _r)) => {
-                    let pat_expr = Expr { ptr: wrapped.as_mut_ptr() };
+                Some(mut pattern) => {
+                    let pat_expr = Expr { ptr: pattern.bytes.as_mut_ptr() };
                     MorkKernel::query_multi(&snap.btm, pat_expr, |_res, _loc| true)
                 }
             };
@@ -2968,8 +3307,8 @@ mod tests {
 
             let reference = match wrap_pattern(&query) {
                 None => 0,
-                Some((mut wrapped, _v, _r)) => {
-                    let pat_expr = Expr { ptr: wrapped.as_mut_ptr() };
+                Some(mut pattern) => {
+                    let pat_expr = Expr { ptr: pattern.bytes.as_mut_ptr() };
                     MorkKernel::query_multi(&snap.btm, pat_expr, |_res, _loc| true)
                 }
             };
