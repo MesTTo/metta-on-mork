@@ -2570,21 +2570,32 @@ mod tests {
         a
     }
 
-    /// The auto-tabler admits by measured cost: a cheap query on a small store
-    /// never occupies cache memory, while a scan-class query on a large store
-    /// tables and replays exactly.
+    /// The auto-tabler admits by measured cost: the admission predicate is
+    /// checked with explicit costs (no wall clock), and the integration half
+    /// pins the scan-class behavior, a 30k-store scan tabling and replaying
+    /// exactly. A small store's fill is deliberately not asserted untabled end
+    /// to end: the gate adapts to real elapsed time, so on a downclocked or
+    /// loaded core a cold 1-atom fill can legitimately cross the threshold.
     #[test]
     fn tabling_admits_only_costly_queries() {
+        assert!(
+            !worth_tabling(std::time::Duration::from_micros(5), 1),
+            "a microsecond fill must not be tabled"
+        );
+        assert!(
+            worth_tabling(QUERY_TABLE_MIN_COST, 1),
+            "a threshold-cost fill must be tabled"
+        );
+        assert!(
+            !worth_tabling(std::time::Duration::from_secs(1), QUERY_CACHE_MAX_ROWS + 1),
+            "an oversized result set must not be tabled at any cost"
+        );
+
         let needle_query = Atom::expr([Atom::var("x"), Atom::sym("mid"), Atom::var("y")]);
 
         let mut small = MorkSpace::new();
         small.add(Atom::expr([Atom::sym("g"), Atom::sym("mid"), Atom::sym("c")]));
         assert_eq!(small.query(&needle_query).len(), 1);
-        assert_eq!(
-            small.query_cache.read().unwrap().len(),
-            0,
-            "a microsecond fill must not be tabled"
-        );
 
         let mut big = MorkSpace::new();
         for i in 0..30_000u32 {
