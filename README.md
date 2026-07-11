@@ -172,6 +172,58 @@ need the congruence lowering — LeaTTa 1.0.8's `MorkMM2Lowering` is the
 mechanized spec for it, CeTTa's `mork:` lane the shipped reference — which is
 the named next step toward the full interpreter on the kernel.
 
+## The chaining metamath suite, unmodified
+
+`cargo run --release --example run_mm2 -- <file.mm2>` runs an MM2 program file on
+`MorkSpace` the way `mork run` does on the kernel binary, but purely through this
+crate: `add_sexpr_text` to load, `step()` to drive the exec scheduler to fixpoint,
+`--count "<pattern>"` to count result atoms. The metamath experiment in
+[trueagi-io/chaining](https://github.com/trueagi-io/chaining/tree/main/experimental/metamath)
+(propositional-calculus proof search over ax-1, ax-2, ax-3 and modus ponens) runs
+unmodified, including the `backward-via-forward` ACT pipeline, whose
+`gen-fromNumber.mm2` and `gen-lte.mm2` table generators write and read their `.act`
+files through the crate. On every program below, the kernel binary built from the
+same integration tree produces byte-identical space dumps and identical counts, so
+the numbers measure the engine, not the bridge. Upstream PeTTa (pure Prolog,
+6b7f52f) is the cross-engine baseline, run on the same machine.
+
+Full forward chaining, `pc-fc.mm2`, all proofs of all theorems up to a depth:
+
+| depth | proofs | MorkSpace `step()` | PeTTa |
+|---|---|---|---|
+| 1 | 9 | 0.3 ms | 0.12 s |
+| 2 | 66 | 0.8 ms | 0.12 s |
+| 3 | 2,759 | 26 ms | 0.23 s |
+| 4 | 5,469,291 | 49.6 s at 0.95 GB | 252.6 s at 117 GB, 0 solutions counted* |
+
+*PeTTa's depth-4 row is the chaining repo's own published CSV (their machine): it
+ran 252.57 s, peaked at 117 GB, and its output contained no countable solutions.
+This machine has 60 GB, so that leg is quoted rather than rerun; the other PeTTa
+rows are local, and 0.12 s is the interpreter's startup floor. Proof counts differ
+between engines (PeTTa says 72 and 3,421 at depths 2 and 3) because the trie
+stores alpha-equivalent proofs once, and differ from the months-old CSV's MORK
+column (67 / 2,909 / 6,087,113) because the engine itself has moved; today's
+kernel and this crate agree exactly.
+
+Backward chaining emulated by forward chaining, `bfc-xp.mm2`, is the case the
+chaining repo measured MM2 losing to PeTTa by 290x and set aside as too slow. The
+flat guarded join bodies in its expansion rules (`sol x decFn x lte`) are exactly
+what the `leapfrog` feature routes when `MORK_LEAPFROG=all`:
+
+| target | upstream quote (their Xeon) | here, default policy | here, `MORK_LEAPFROG=all` | PeTTa `obc`, local |
+|---|---|---|---|---|
+| jarr (size 13) | 40.4 s | 17.1 s | **145 ms** | 0.13 s |
+| imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **863 ms** | 0.17 s |
+
+Both engines find the same proofs (two for jarr, one for imim1), the routed and
+unrouted space dumps are byte-identical, and the kernel's own counters show where
+the 117x on jarr comes from: 220,380,293 transitions collapse to 29,969. The knob
+is directional, not free: on the pure-enumeration `pc-fc.mm2` depth 3 it costs
+1.4x (26 ms to 37 ms), identical outputs either way. Semi-naive stepping cannot
+help this program family at all, because the programs respawn their exec rules
+under a fresh location every round and a per-rule frontier has no history for a
+new rule; measured 1.09x at forward depth 4 and nothing on `bfc-xp.mm2`.
+
 ## Against stock GroundingSpace
 
 Same workload (load N `(edge nK nK+1)` atoms, then a point query), measured back to back
@@ -296,6 +348,8 @@ query shape.
 - `examples/factorized_count.rs` — factorized versus enumerating conjunctive counts.
 - `examples/query_tabling.rs` — tabled replay against the live scan.
 - `examples/shared_space_parallel.rs` — one `Send + Sync` space shared across threads.
+- `examples/run_mm2.rs` — run any MM2 program file on `MorkSpace`; the chaining
+  metamath suite runs unmodified.
 - `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
 - `examples/process_calculus_step.rs` — the kernel's process-calculus dish, naive versus semi-naive.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
