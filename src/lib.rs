@@ -14,9 +14,9 @@
 //! symbols are stored as raw bytes rather than interned tokens.)
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use hyperon_atom::matcher::{Bindings, BindingsSet};
+use hyperon_atom::matcher::{match_atoms, Bindings, BindingsSet};
 use hyperon_atom::{next_variable_id, Atom, Grounded, GroundedAtom, VariableAtom};
 use hyperon_common::FlexRef;
 use hyperon_space::{Space, SpaceCommon, SpaceMut, SpaceVisitor};
@@ -100,6 +100,36 @@ fn ground_prefix_len(bytes: &[u8]) -> usize {
         }
     }
     pos
+}
+
+/// Whether an encoded fact span holds only ground bytes (no NewVar/VarRef tag).
+/// A ground fact has no helper variables to leak, so its raw-row replay is
+/// exactly the narrowed result and the per-row Hyperon rematch can be skipped;
+/// this keeps the byte-seek constants (column-index seeks, warm point lookups)
+/// on var-free data, which is the latch's whole class.
+fn span_is_ground(bytes: &[u8]) -> bool {
+    fn walk(bytes: &[u8], pos: &mut usize) -> Option<bool> {
+        let tag = byte_item(*bytes.get(*pos)?);
+        *pos += 1;
+        match tag {
+            Tag::SymbolSize(size) => {
+                *pos = (*pos).checked_add(size as usize)?;
+                bytes.get(..*pos)?;
+                Some(true)
+            }
+            Tag::Arity(k) => {
+                for _ in 0..k {
+                    if !walk(bytes, pos)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            Tag::NewVar | Tag::VarRef(_) => Some(false),
+        }
+    }
+    let mut pos = 0usize;
+    walk(bytes, &mut pos) == Some(true)
 }
 
 fn skip_encoded_atom(bytes: &[u8], pos: &mut usize) -> Option<()> {
@@ -450,6 +480,7 @@ impl MorkSpace {
                         &pattern.refs,
                         &reg,
                         &pattern.evaluated,
+                        conjuncts(query).is_none().then_some(query),
                     );
                 }
             }
@@ -469,6 +500,7 @@ impl MorkSpace {
             &pattern.refs,
             &reg,
             &pattern.evaluated,
+            conjuncts(query).is_none().then_some(query),
         )
     }
 
@@ -993,6 +1025,17 @@ fn apply_live_refs(
     filtered
 }
 
+fn result_var_set<'a>(
+    vars: &'a [VariableAtom],
+    refs: &[(usize, Atom)],
+) -> HashSet<&'a VariableAtom> {
+    let hidden: HashSet<usize> = refs.iter().map(|(idx, _)| *idx).collect();
+    vars.iter()
+        .enumerate()
+        .filter_map(|(idx, var)| (!hidden.contains(&idx)).then_some(var))
+        .collect()
+}
+
 /// Classifies a query for the column-index route: single factor, the fork's
 /// admitted fragment, not leading-bound. Returns the classification, the chosen
 /// (most selective by longest encoded value) bound position and its value, plus
@@ -1049,6 +1092,7 @@ fn indexed_facts_to_bindings(
     let args = &classified.args;
     let ncols = args.len();
     reg.register(query);
+    let result_vars = result_var_set(vars, refs);
     let mut set = BindingsSet::empty();
     'fact: for fact in facts {
         let cols = argindex::split_columns(&fact[classified.functor_prefix.len()..], ncols);
@@ -1089,6 +1133,9 @@ fn indexed_facts_to_bindings(
                 }
             }
         }
+        // The var-freeness latch admits this route only on ground stores, so
+        // every binding maps a query variable to a ground value and there is
+        // nothing to narrow away.
         set.extend(apply_live_refs(acc, refs, vars));
     }
     set
@@ -1118,7 +1165,7 @@ struct RawBinding {
 #[derive(Clone)]
 struct RawRow {
     entries: Vec<RawBinding>,
-    specificity: Vec<u8>,
+    fact: Option<Vec<u8>>,
     sequence: usize,
 }
 
@@ -1134,9 +1181,6 @@ fn query_btm_rows(btm: &PathMap<()>, wrapped: &[u8]) -> Vec<RawRow> {
     MorkKernel::query_multi(btm, pat_expr, |res, loc| {
         let Err(bindings) = res else { return true };
         let loc_span = unsafe { loc.span().as_ref() };
-        let specificity = loc_span
-            .map(|span| specificity_key(pattern_factor, span))
-            .unwrap_or_default();
         let sequence = rows.len();
         let entries = bindings
             .iter()
@@ -1150,35 +1194,71 @@ fn query_btm_rows(btm: &PathMap<()>, wrapped: &[u8]) -> Vec<RawRow> {
             .collect::<Vec<_>>();
         rows.push(RawRow {
             entries,
-            specificity,
+            fact: loc_span.map(|span| span.to_vec()),
             sequence,
         });
         true
     });
-    rows.sort_by(|a, b| {
-        a.specificity
-            .cmp(&b.specificity)
-            .then_with(|| a.sequence.cmp(&b.sequence))
-    });
+    // The specificity key exists to order rows, so a 0- or 1-row result skips
+    // building it entirely (point lookups stay allocation-lean); a multi-row
+    // result derives each key once from the captured fact span.
+    if rows.len() > 1 {
+        rows.sort_by_cached_key(|row| {
+            (
+                row.fact
+                    .as_deref()
+                    .map(|span| specificity_key(pattern_factor, span))
+                    .unwrap_or_default(),
+                row.sequence,
+            )
+        });
+    }
     rows
 }
 
-/// Decodes raw matcher rows into the caller's `BindingsSet`. Every row gets one
-/// fresh id: every data variable decoded below shares it, so the result is
-/// internally coreferent by name yet globally distinct from every other result
-/// and query call -- replayed rows included. Without this, a data var `v1_0`
-/// from one match aliased a `v1_0` from a deeper recursion's match, and the
-/// interpreter's threaded bindings collapsed the branch to empty (b2
-/// backchaining: mortal<-human<-And).
+/// Decodes raw matcher rows into the caller's `BindingsSet`.
+///
+/// Single-factor rows carry the matched fact span. Re-decode that fact, run it
+/// through Hyperon's matcher, then narrow to the query variables. That follows
+/// `GroundingSpace`'s `AtomIndex::query` path and prevents matched-fact helper
+/// variables from leaking into recursive interpreter bindings. Raw row replay
+/// remains the fallback for cases without a fact span.
+///
+/// Every raw replay row gets one fresh id: every data variable decoded below
+/// shares it, so the result is internally coreferent by name yet globally
+/// distinct from every other result and query call -- replayed rows included.
+/// Without this, a data var `v1_0` from one match aliased a `v1_0` from a
+/// deeper recursion's match, and the interpreter's threaded bindings collapsed
+/// the branch to empty (b2 backchaining: mortal<-human<-And).
 fn rows_to_bindings(
     rows: &[RawRow],
     vars: &[VariableAtom],
     refs: &[(usize, Atom)],
     reg: &GroundedRegistry,
     query_evaluated: &EvaluatedSpans,
+    source_query: Option<&Atom>,
 ) -> BindingsSet {
     let mut set = BindingsSet::empty();
+    let result_vars = result_var_set(vars, refs);
     for row in rows {
+        let fact_needs_narrowing = row.fact.as_deref().is_some_and(|f| !span_is_ground(f));
+        if let (Some(query), Some(fact), true) = (source_query, row.fact.as_deref(), fact_needs_narrowing) {
+            let mut pos = 0usize;
+            let mut ctx = DecodeCtx {
+                var_counter: 0,
+                grounded: Some(reg),
+                ns: 1,
+                query_vars: vars,
+                evaluated: None,
+                result_id: next_variable_id(),
+            };
+            if let Some(fact_atom) = decode_atom(fact, &mut pos, &mut ctx) {
+                set.extend(match_atoms(&fact_atom, query).map(|bindings| {
+                    bindings.narrow_vars(&result_vars)
+                }));
+                continue;
+            }
+        }
         let mut acc = BindingsSet::single();
         let result_id = next_variable_id();
         // The key (ns, idx) names a variable by its namespace -- 0 is the query
@@ -1228,7 +1308,24 @@ fn rows_to_bindings(
         }
         // e3: `&state-active` matches the goal whose cell currently holds that
         // value, not one mutated since it was stored.
-        set.extend(apply_live_refs(acc, refs, vars));
+        //
+        // A row whose keys are all query-namespace and whose captured spans are
+        // all ground binds nothing but query variables to ground values, so the
+        // narrow is a no-op and skipped (it costs a per-result equivalence-class
+        // walk that dominated warm ground lookups).
+        let needs_narrowing = row
+            .entries
+            .iter()
+            .any(|b| b.key_ns != 0 || !span_is_ground(&b.span));
+        if needs_narrowing {
+            set.extend(
+                apply_live_refs(acc, refs, vars)
+                    .into_iter()
+                    .map(|bindings| bindings.narrow_vars(&result_vars)),
+            );
+        } else {
+            set.extend(apply_live_refs(acc, refs, vars));
+        }
     }
     set
 }
@@ -1256,6 +1353,7 @@ fn query_btm(btm: &PathMap<()>, query: &Atom, grounded: Option<&GroundedRegistry
         &pattern.refs,
         &reg,
         &pattern.evaluated,
+        conjuncts(query).is_none().then_some(query),
     )
 }
 
@@ -2282,6 +2380,52 @@ mod tests {
 
         assert_eq!(ordered(&mork, &mp_query), ordered(&ground, &mp_query));
         assert_eq!(ordered(&mork, &ax_query), ordered(&ground, &ax_query));
+    }
+
+    #[test]
+    fn query_results_are_narrowed_to_query_variables() {
+        let fact = Atom::expr([
+            Atom::sym(":"),
+            Atom::sym("ax-1"),
+            Atom::expr([
+                Atom::sym("->"),
+                Atom::var("p"),
+                Atom::expr([Atom::sym("->"), Atom::var("q"), Atom::var("p")]),
+            ]),
+        ]);
+        let query = Atom::expr([
+            Atom::sym(":"),
+            Atom::var("label"),
+            Atom::expr([
+                Atom::sym("->"),
+                Atom::var("outer"),
+                Atom::expr([Atom::sym("->"), Atom::var("inner"), Atom::var("outer")]),
+            ]),
+        ]);
+        let mut ground = GroundingSpace::new();
+        let mut mork = MorkSpace::new();
+        ground.add(fact.clone());
+        mork.add(fact);
+
+        let ground_results = ground.query(&query);
+        let mork_results = mork.query(&query);
+        let query_vars = query_variables(&query);
+        assert_eq!(
+            projected_results(&mork_results, &query_vars),
+            projected_results(&ground_results, &query_vars),
+        );
+
+        let public_vars = mork_results
+            .iter()
+            .flat_map(|bindings| bindings.vars())
+            .map(|var| var.name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            public_vars,
+            ["inner".to_string(), "label".to_string(), "outer".to_string()]
+                .into_iter()
+                .collect(),
+        );
     }
 
     proptest! {
