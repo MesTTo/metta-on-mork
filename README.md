@@ -216,8 +216,13 @@ factor guards through a shared whole column (`leapfrog-acyclic-guard`), so the
 
 | target | upstream quote (their Xeon) | unrouted product | routed (the default now) | PeTTa `obc`, local |
 |---|---|---|---|---|
-| jarr (size 13) | 40.4 s | 17.1 s | **140 ms** | 0.13 s |
-| imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **875 ms** | 0.17 s |
+| jarr (size 13) | 40.4 s | 17.1 s | **94 ms** | 0.13 s |
+| imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **564 ms** | 0.17 s |
+
+The routed times include the kernel's subterm-cursor rework (incremental completion
+state plus unary-spine skipping, `leapfrog-acyclic-guard` second commit), which took
+the join's profile share from about 40% to 16% with byte-identical dumps; before it
+the routed runs measured 140 ms and 875 ms.
 
 Both engines find the same proofs (two for jarr, one for imim1), the routed and
 unrouted space dumps are byte-identical, and the kernel's own counters show where
