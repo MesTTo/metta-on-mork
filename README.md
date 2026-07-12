@@ -325,6 +325,41 @@ join/meet/subtract on the trie structure itself, sharing common subtrees with bo
 instead of iterating atoms; they decline on stores holding mutable grounded atoms (space-local
 identity ids), and a proptest differential holds each equal to per-atom set semantics.
 
+## PSPACE-class search as saturation: the demos/ directory
+
+Four demonstrators run hard-class search directly on the kernel's fact engine,
+each gated by an exact external oracle. They compose the engine features this
+crate exposes: quiesce-headed barrier staging, guarded emission (stored De
+Bruijn schemas drop covered candidates, which is nogood learning and
+stratified negation-as-absence in one mechanism), subsumption-schema pruning,
+and small-table retrieval joins.
+
+- `demos/tqbf`: forall-exists QBF decided by flat counterexample-guided
+  expansion, both as driver-staged strata and as one barrier-staged engine
+  program per CEGIS round. Verdicts are exact against a recursive oracle on
+  every battery run to date (327 verdicts over random and planted families up
+  to 14+14 variables). Per-depth forbidden schemas cut the explored
+  assignment tree from 510 nodes to 71 on the measured instance.
+- `demos/plan`: 8-puzzle planning by bidirectional meet-in-the-middle under
+  barrier staging. On six instances at optimal distances 8 to 20 the meet
+  depth equals the BFS oracle exactly; at distance 20 the forward frontier
+  visits 54,802 states in 1.54s while the bidirectional meet visits 1,412 in
+  0.12s.
+- `demos/countdp`: derivation counting without enumeration (dynamic
+  programming over theorem-schema states with in-engine products). Exact
+  against the enumeration oracle at every checkable stratum; 6,210x past it.
+- `demos/subsume`: forward proof closure under most-general-schema
+  subsumption, the guarded-emit antichain that took the metamath closure from
+  310.5s to 377ms at the same coverage.
+
+Set `MORK_BIN` to a MORK kernel binary built with
+`--features semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,retrieval_join`
+and run any driver with python3; each REPORT.md records the measured numbers
+and the honest scope of its claim. The MM2 semantics these programs rely on
+is the one LeaTTa's `morkEncodedSpaceBackend` law pins operationally: the
+serial fold over the encoded space, with every fast path byte-identical to
+the reference matcher.
+
 ## WILLIAM, carried in-crate
 
 `compression_gain_index(ref_cost)` builds the whitepaper-5.12 term-boundary compression-gain
