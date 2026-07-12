@@ -1,6 +1,7 @@
 __pycache__/
 run/
 run-v1/
+run-v2/
 *.dump
 *.log
 results.json
