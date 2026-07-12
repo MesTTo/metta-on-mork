@@ -32,7 +32,8 @@ MORK = os.environ.get("MORK_BIN", "mork")
 
 
 def project_clause(clause, cex, a_vars, e_vars):
-    """Clause under a universal assignment: None if satisfied by cex,
+    """Clause under a universal assignment: None if satisfied by cex (or a
+    tautology -- both polarities of some Y-variable make it always true),
     else the list of Y-literals that must save it."""
     y_lits = []
     for lit in clause:
@@ -41,6 +42,8 @@ def project_clause(clause, cex, a_vars, e_vars):
             if (lit > 0) == cex[v]:
                 return None
             continue
+        if -lit in y_lits:
+            return None
         y_lits.append(lit)
     return y_lits
 
@@ -164,6 +167,16 @@ def solve_forall(matrix, y_set, a_list, e_vars, workdir, tag):
     k = len(a_list)
     a_index = {v: i for i, v in enumerate(a_list)}
     a_vars = set(a_list)
+    if k == 0:
+        # Degenerate universal block: the empty x falsifies a member iff some
+        # clause is all-false under it (no X-literals exist to falsify).
+        for y_assign in y_set:
+            if not any(
+                all((lit > 0) != y_assign[abs(lit)] for lit in clause)
+                for clause in matrix
+            ):
+                return None, {"reason": "y-unfalsifiable"}
+        return {}, {"strata": 0, "candidates": 0}
     per_y_imposes = []
     for y_assign in y_set:
         imposes = []

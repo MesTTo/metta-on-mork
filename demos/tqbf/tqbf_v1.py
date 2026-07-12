@@ -42,6 +42,7 @@ def clause_tables(matrix, a_index, e_index, k_e):
     for j, clause in enumerate(matrix):
         xlits, cells, ok = [], ["u"] * len(a_index), True
         constrained = {}
+        taut = False
         for lit in clause:
             v = abs(lit)
             if v in a_index:
@@ -52,7 +53,17 @@ def clause_tables(matrix, a_index, e_index, k_e):
                 cells[i] = want
                 xlits.append((i, "1" if lit > 0 else "0"))
             else:
-                constrained[e_index[v]] = "0" if lit > 0 else "1"
+                want = "0" if lit > 0 else "1"
+                i = e_index[v]
+                if constrained.get(i, want) != want:
+                    taut = True
+                constrained[i] = want
+        if taut:
+            # Both polarities of a Y-variable: the clause is always satisfied.
+            # No forbid schema, no dead-clause marker, no impose row (the
+            # member loop's y_saved check already skips it).
+            rows.append((f"c{j}", xlits, [], None, True))
+            continue
         if constrained:
             # One nil-terminated pattern per depth d from (top constrained
             # position + 1) to k: the guard key at depth d is exactly d deep,
@@ -97,11 +108,11 @@ def round_program(matrix, a_list, e_list, members, x_probe):
         facts.append(f"(cl {cid})")
         for i, b in xlits:
             facts.append(f"(xlit {cid} {i} {b})")
-        if schemas is not None:
+        if schemas is None:
+            facts.append(f"(fempty {cid})")
+        else:
             for schema in schemas:
                 facts.append(f"(fschema {cid} {schema})")
-        else:
-            facts.append(f"(fempty {cid})")
 
     # The probe X (previous x*): clause satisfaction under it.
     for v, val in x_probe.items():
@@ -229,6 +240,11 @@ def parse_cons(term):
 def cegis_v1(prefix, matrix, workdir, tag):
     (qa, a_list), (qe, e_list) = prefix
     assert qa == "a" and qe == "e"
+    if not a_list or not e_list:
+        # Degenerate blocks make zero-column programs; v0's arms handle both
+        # exactly, so route them there.
+        got, _, _, _ = cegis_v0(prefix, matrix, workdir, f"{tag}-degen")
+        return got, 0, 0.0
     members = [{v: False for v in e_list}]
     x_probe = {v: False for v in a_list}
     rounds = 0
@@ -280,6 +296,32 @@ def cegis_v1(prefix, matrix, workdir, tag):
         x_probe = x_star
 
 
+EDGE_CASES = [
+    ("taut_y", [("a", [1]), ("e", [2, 3])], [[1, 2], [-1, -2], [-3], [-3, 3]]),
+    ("no_forall_empty", [("a", []), ("e", [1])], [[]]),
+    ("no_forall_sat", [("a", []), ("e", [1])], [[1]]),
+    ("empty_clause", [("a", [1]), ("e", [2])], [[]]),
+    ("dup_same_pol", [("a", [1]), ("e", [2])], [[2, 2, 1], [-1, -2]]),
+    ("taut_x", [("a", [1]), ("e", [2])], [[1, -1], [2]]),
+    ("no_exists", [("a", [1]), ("e", [])], [[1]]),
+]
+
+
+def edge_battery(workdir):
+    """Adversarial clause shapes (found by review): tautologies, duplicates,
+    empty clauses, degenerate quantifier blocks. Every driver change must
+    keep this green."""
+    ok = True
+    for name, prefix, matrix in EDGE_CASES:
+        want = evaluate(prefix, matrix)
+        v0 = cegis_v0(prefix, matrix, workdir, f"edge-{name}-v0")[0]
+        v1, _, _ = cegis_v1(prefix, matrix, workdir, f"edge-{name}-v1")
+        match = want == v0 == v1
+        ok &= match
+        print(f"edge {name}: oracle={want} v0={v0} v1={v1} {'OK' if match else '<<<MISMATCH'}")
+    return ok
+
+
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     m = int(sys.argv[2]) if len(sys.argv) > 2 else 6
@@ -287,6 +329,8 @@ def main():
     family = sys.argv[4] if len(sys.argv) > 4 else "random"
     workdir = ROOT / "run-v1"
     workdir.mkdir(exist_ok=True)
+    if family == "edge":
+        sys.exit(0 if edge_battery(workdir) else 1)
     gen = planted_qbf if family == "planted" else random_qbf
     ok = bad = 0
     for seed in range(seeds):
