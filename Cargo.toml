@@ -26,6 +26,7 @@ default = []
 semi-naive = ["mork/semi_naive_ic"]          # metta_calculus fixpoints match only the delta per round
 leapfrog = ["mork/leapfrog"]                 # flat conjunctive exec bodies route to the WCO leapfrog join
 factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exec sinks without enumerating the join
+guarded-emit = ["mork/guarded_emit"]        # guarded emit sinks report consulted and dropped candidate counts
 
 [[example]]
 name = "factorized_count"

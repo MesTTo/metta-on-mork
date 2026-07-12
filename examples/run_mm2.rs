@@ -120,6 +120,8 @@ fn main() {
         space.rejected_atom_count()
     );
 
+    #[cfg(feature = "guarded-emit")]
+    mork::reset_guarded_emit_stats();
     let t = Instant::now();
     let performed = space.step(steps);
     let run = t.elapsed();
@@ -128,6 +130,14 @@ fn main() {
         if naive { "naive" } else { "default frontier" },
         space.len()
     );
+    #[cfg(feature = "guarded-emit")]
+    {
+        let stats = mork::guarded_emit_stats();
+        println!(
+            "guarded_emit consulted {} candidates; dropped {}",
+            stats.consulted, stats.dropped
+        );
+    }
 
     if !patterns.is_empty() {
         let snapshot = space.snapshot();
