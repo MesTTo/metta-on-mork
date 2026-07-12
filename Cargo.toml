@@ -28,7 +28,8 @@ leapfrog = ["mork/leapfrog"]                 # flat conjunctive exec bodies rout
 factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exec sinks without enumerating the join
 guarded-emit = ["mork/guarded_emit"]        # guarded emit sinks report consulted and dropped candidate counts
 retrieval-join = ["mork/retrieval_join"]
-bulk-emit = ["mork/bulk_emit"]   # small schema-table join factors apply per tuple by unifiability retrieval
+bulk-emit = ["mork/bulk_emit"]
+witness-select = ["mork/witness_select"]   # small schema-table join factors apply per tuple by unifiability retrieval
 
 [[example]]
 name = "factorized_count"

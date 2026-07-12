@@ -5,3 +5,4 @@ run-v2/
 *.dump
 *.log
 results.json
+demos/exphalving/*.dump
