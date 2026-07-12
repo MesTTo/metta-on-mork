@@ -1,0 +1,6 @@
+__pycache__/
+run/
+run-v1/
+*.dump
+*.log
+results.json
