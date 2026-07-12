@@ -29,7 +29,7 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MITM = Path(os.environ.get("MITM_DUMPS", ROOT.parent / "mitm"))
+MITM = Path(os.environ.get("MITM_DUMPS", ROOT / "oracle"))
 MORK = os.environ.get("MORK_BIN", "mork")
 
 AXIOMS = [

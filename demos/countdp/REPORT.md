@@ -40,6 +40,16 @@ matches exactly at every stratum. Same lesson as the guard-walk fix: identity
 of schematic things must be carried explicitly, never inferred from bytes that
 alpha-collapse.
 
+## Reproducing
+
+`MORK_BIN=<kernel binary> python3 count_dp.py 9` checks the DP against the
+committed enumeration dump (oracle/fwd-only-hf9.dump) and must print PASS
+with exact per-K matches. Larger scales need the corresponding
+fwd-only-hfN.dump enumerations (generate the program with
+../subsume/build_subsume_programs.py N, run it with the kernel, point
+MITM_DUMPS at the directory); without them the oracle step reports itself
+skipped rather than passing vacuously.
+
 ## Notes
 
 - i64 products in-engine; driver sums in Python bigints. Max observed count

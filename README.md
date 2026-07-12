@@ -337,20 +337,26 @@ and small-table retrieval joins.
 - `demos/tqbf`: forall-exists QBF decided by flat counterexample-guided
   expansion, both as driver-staged strata and as one barrier-staged engine
   program per CEGIS round. Verdicts are exact against a recursive oracle on
-  every battery run to date (327 verdicts over random and planted families up
-  to 14+14 variables). Per-depth forbidden schemas cut the explored
-  assignment tree from 510 nodes to 71 on the measured instance.
+  every generated battery (327 verdicts over random and planted families up
+  to 14+14 variables) and on a committed adversarial edge battery
+  (tautologies, duplicate literals, empty clauses, degenerate quantifier
+  blocks; run it with `tqbf_v1.py 0 0 0 edge`). Per-depth forbidden schemas
+  cut the explored assignment tree from 510 nodes to 71 on the measured
+  instance.
 - `demos/plan`: 8-puzzle planning by bidirectional meet-in-the-middle under
   barrier staging. On six instances at optimal distances 8 to 20 the meet
   depth equals the BFS oracle exactly; at distance 20 the forward frontier
   visits 54,802 states in 1.54s while the bidirectional meet visits 1,412 in
   0.12s.
 - `demos/countdp`: derivation counting without enumeration (dynamic
-  programming over theorem-schema states with in-engine products). Exact
-  against the enumeration oracle at every checkable stratum; 6,210x past it.
+  programming over theorem-schema states with in-engine products). The
+  committed oracle dump checks it exactly at Hf=9 out of the box
+  (3/6/24/132/729 per stratum); REPORT.md records the larger measured scales
+  and how to regenerate their enumerations.
 - `demos/subsume`: forward proof closure under most-general-schema
-  subsumption, the guarded-emit antichain that took the metamath closure from
-  310.5s to 377ms at the same coverage.
+  subsumption. `run_coverage.py` regenerates programs, runs both closures,
+  and checks the antichain coverage law at any Hf; REPORT.md records the
+  measured 310.5s -> 377ms at Hf=12 from the working runs.
 
 Set `MORK_BIN` to a MORK kernel binary built with
 `--features semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,retrieval_join`

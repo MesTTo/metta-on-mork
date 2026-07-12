@@ -71,3 +71,12 @@ identity); L6 should lift it from sink-side filter to join-side factor.
 - mitm-sub-*.mm2, mitm-subled-*.mm2 — downstream MITM over subsumed strata
   (compound-interior and theorem-led variants).
 - micro-freevar.mm2, micro-realindex.mm2, bisect.mm2 — the soundness-bug hunt.
+
+
+## Reproducing from this directory
+
+`MORK_BIN=<kernel binary> python3 run_coverage.py 6 9` regenerates the
+baseline and subsumed programs, runs both on the kernel, and checks
+antichain coverage per stratum. The numbers in this report came from the
+ai-tmp working runs at Hf up to 12; the committed runner reproduces the
+mechanism and coverage law at any Hf you give it (time grows with Hf).
