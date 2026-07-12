@@ -56,6 +56,61 @@ S = expansion set of Y-assignments. Per round, ONE engine program:
    nullified as exec-only churn (snapshot restore). Every init/re-arm
    template needs a non-exec witness fact -- the (armed X) idiom.
 
+## v2: arbitrary quantifier alternations (full TQBF)
+
+tqbf_v2.py lifts the demonstrator from the forall-exists fragment to full
+TQBF -- the canonical PSPACE-complete problem -- by recursive expansion
+CEGAR, the RAReQS algorithm (Janota et al.; the reference implementation's
+RASolverNonLeaf game loop). One polarity throughout: a Game object builds
+its dual ONCE (quantifiers flipped, matrix negated through an innermost
+clause-selector block -- the choice of falsified clause may depend on every
+deeper move, so the selectors quantify innermost), and positions are
+(game, level), so switching sides never grows the formula. Per node: solve
+the abstraction (my block plus per-member primed copies of the blocks
+beyond the opponent), let the opponent answer by recursion, refine with the
+answer as a new expansion member. Existential leaves run on the engine;
+after dualization there are no universal leaves.
+
+Verified: an 8-case adversarial edge battery (deep tautologies, empty
+clauses at depth, all-universal prefixes) plus randomized differentials
+against the recursive oracle at 2 through 12 quantifier blocks under both
+leading quantifiers (157 verdicts, 0 mismatches on the final state), and a
+QDIMACS reader with an exact round-trip test.
+
+The standard QBF preprocessing trio (universal reduction, unit
+propagation, pure literals -- the QDPLL/DepQBF core rules) runs at every
+node to fixpoint; it is what makes deep prefixes tractable (a 10-block
+instance that ground past 2400 seconds decides in milliseconds once the
+reductions run, matching how every reference solver leans on
+preprocessing). A per-query leaf memo (canonicalized block-SAT instances)
+and a one-process barrier-staged engine leaf (the depth loop inside
+quiesce barriers instead of one process per stratum) carry the constants.
+
+Four solver-grade bugs were caught by the batteries and fixed:
+- Selector placement: putting the negation selectors in the OUTER dual
+  block under-finds falsifications (the clause choice must sit inside the
+  deeper quantifiers); caught as leading-universal mismatches at 3 and 5
+  blocks.
+- Fabricated first moves, twice: a False verdict from preprocessing must
+  WITNESS the universal values that realize it -- the emptied clause's
+  whole deletion history plus every pure-universal commitment -- and no
+  emitted bit may ever contradict the accumulated assignment (a dominant
+  forced commitment that the search then contradicted handed the opponent
+  a spurious win). Both were caught as repeated expansion members by the
+  progress invariant and convicted by brute force over the dumped
+  position (stall_convict.py, committed).
+- The engine's row envelope: the kernel's documented encoding
+  (MORK wiki, Data-in-MORK.md) caps arity, VarRef level, and symbol length
+  at 63 per node, and a wider flat (v ...) row silently never enters the
+  space in a release build -- the engine leaf then reports false UNSAT
+  (reproduced at width 70 against a satisfiable selector CNF). The shared
+  driver now refuses wide rows loudly, and wide selector leaves -- an
+  artifact of nested dual copies, not of input blocks -- run on an exact
+  host solver specialized to the selector shape. The wiki's nested-tuple
+  workaround would fix the encoding but not the exponential per-depth
+  materialization on wide under-constrained blocks, so the algorithm
+  boundary sits at the same width.
+
 ## Honesty
 
 These instance sizes are trivial for any real QBF solver (DepQBF, CAQE

@@ -48,6 +48,91 @@ def project_clause(clause, cex, a_vars, e_vars):
     return y_lits
 
 
+def barrier_leaf_program(block, matrix):
+    """One engine program deciding block-SAT: cons-list candidates grow
+    through quiesce-barrier depth strata under per-depth clause-derived
+    forbidden schemas (the v1 B-side, projected matrix form). One process
+    per leaf instead of one per stratum."""
+    k = len(block)
+    index = {v: i for i, v in enumerate(block)}
+    facts = ["(ycand 0 nil)", "(depth 0)", "(bit 0)", "(bit 1)"]
+    facts += [f"(incFn {i} {i + 1})" for i in range(k + 1)]
+    facts += [f"(lte {i} {j})" for i in range(k + 1) for j in range(i, k + 1)]
+    for clause in matrix:
+        constrained = {}
+        taut = False
+        for lit in clause:
+            i = index[abs(lit)]
+            want = "0" if lit > 0 else "1"
+            if constrained.get(i, want) != want:
+                taut = True
+            constrained[i] = want
+        if taut:
+            continue
+        top = max(constrained)
+        for d in range(top + 1, k + 1):
+            t = "nil"
+            for pos in range(d):
+                t = f"(cons {constrained.get(pos, f'$w{pos}')} {t})"
+            facts.append(f"(forbid {t})")
+    rules = f"""
+((extend rule)
+  (, ((extend rule) $sp $st)
+     (ycand $d $prev)
+     (depth $d)
+     (incFn $d $d1)
+     (lte $d1 {k})
+     (bit $nb))
+  (O (guard (forbid (cons $nb $prev)) (ycand $d1 (cons $nb $prev)))))
+((bstep rule)
+  (, ((bstep rule) $ap $at)
+     ((extend rule) $ep $et)
+     (depth $d)
+     (lte $d {k - 1})
+     (incFn $d $d1))
+  (O (- (depth $d))
+     (+ (depth $d1))
+     (+ (exec (30 extend) $ep $et))
+     (+ (exec (quiesce 31 bstep) $ap $at))))
+(exec (20 binit)
+  (, ((extend rule) $ep $et)
+     ((bstep rule) $bp $bt))
+  (, (armed binit)
+     (exec (30 extend) $ep $et)
+     (exec (quiesce 31 bstep) $bp $bt)))
+"""
+    return "\n".join(facts) + rules
+
+
+def parse_leaf_cons(term):
+    bits = []
+    t = term.strip()
+    while t.startswith("(cons "):
+        inner = t[len("(cons "):-1]
+        bits.append(inner[0])
+        t = inner[2:].strip()
+    return list(reversed(bits))
+
+
+def barrier_block_sat(block, matrix, workdir, tag):
+    """Engine leaf in one process: a satisfying assignment of `block` for a
+    matrix over `block` only, or None."""
+    if len(block) > 62:
+        raise ValueError(
+            f"block of {len(block)} exceeds the engine's 62-column row budget"
+        )
+    src = workdir / f"{tag}.mm2"
+    dump = workdir / f"{tag}.dump"
+    src.write_text(barrier_leaf_program(block, matrix))
+    subprocess.run([MORK, "run", str(src), str(dump)], check=True, capture_output=True)
+    k = len(block)
+    for line in dump.read_text().splitlines():
+        if line.startswith(f"(ycand {k} "):
+            bits = parse_leaf_cons(line[len(f"(ycand {k} "):-1])
+            return {block[i]: bits[i] == "1" for i in range(k)}
+    return None
+
+
 def forbid_schema(y_lits, e_index, depth):
     """The assignment pattern that falsifies all y_lits: position i fixed to
     the falsifying bit, $ elsewhere. Only meaningful once every constrained
@@ -68,6 +153,17 @@ def forbid_schema(y_lits, e_index, depth):
 
 
 def solve_exists(matrix, cexes, a_vars, e_vars, workdir, tag):
+    if len(e_vars) > 62:
+        # Documented encoding envelope (MORK wiki, Data-in-MORK.md: arity,
+        # VarRef level, and symbol length are all 0..=63; nest tuples to go
+        # wider). A wider flat (v ...) row silently fails to enter the space
+        # in release builds and the search reports false UNSAT (measured at
+        # width 70: engine None vs SAT). Refuse loudly; callers route wide
+        # blocks to an exact host solver, where chunked nesting would fix
+        # the encoding but not the exponential per-depth materialization.
+        raise ValueError(
+            f"block of {len(e_vars)} exceeds the engine's 62-column row budget"
+        )
     """Engine strata: find one Y-assignment satisfying matrix under every
     counterexample, or report none. Returns (assignment dict | None, stats)."""
     k = len(e_vars)

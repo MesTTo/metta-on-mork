@@ -334,15 +334,19 @@ Bruijn schemas drop covered candidates, which is nogood learning and
 stratified negation-as-absence in one mechanism), subsumption-schema pruning,
 and small-table retrieval joins.
 
-- `demos/tqbf`: forall-exists QBF decided by flat counterexample-guided
-  expansion, both as driver-staged strata and as one barrier-staged engine
-  program per CEGIS round. Verdicts are exact against a recursive oracle on
-  every generated battery (327 verdicts over random and planted families up
-  to 14+14 variables) and on a committed adversarial edge battery
-  (tautologies, duplicate literals, empty clauses, degenerate quantifier
-  blocks; run it with `tqbf_v1.py 0 0 0 edge`). Per-depth forbidden schemas
-  cut the explored assignment tree from 510 nodes to 71 on the measured
-  instance.
+- `demos/tqbf`: QBF at three levels. tqbf_cegis/tqbf_v1 decide the
+  forall-exists fragment by flat counterexample-guided expansion, driver-
+  staged or as one barrier-staged engine program per CEGIS round; tqbf_v2
+  decides FULL TQBF (arbitrary quantifier alternations, QDIMACS accepted)
+  by recursive expansion CEGAR, the RAReQS game with a once-built dual and
+  engine-run existential leaves. Verdicts are exact against a recursive
+  oracle on every battery: 327 fragment verdicts, and v2 differentials at
+  2 through 12 quantifier blocks under both leading quantifiers plus
+  adversarial edge batteries (`tqbf_v1.py 0 0 0 edge`, `tqbf_v2.py edge`).
+  Per-depth forbidden schemas cut the explored assignment tree from 510
+  nodes to 71 on the measured instance; wide selector leaves created by
+  nested duals run on an exact host solver at the kernel's documented
+  arity-63 row envelope (MORK wiki, Data-in-MORK).
 - `demos/plan`: 8-puzzle planning by bidirectional meet-in-the-middle under
   barrier staging. On six instances at optimal distances 8 to 20 the meet
   depth equals the BFS oracle exactly; at distance 20 the forward frontier
