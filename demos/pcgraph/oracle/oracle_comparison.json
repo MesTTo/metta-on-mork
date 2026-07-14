@@ -1,0 +1,71 @@
+{
+  "interpretation": "jpc native supervised ePC initializes a hidden and an output error variable. error_based_PC/PCE optimizes hidden errors only and keeps the output residual inside the loss.",
+  "jpc_native_vs_error_based_pc_paper_path": {
+    "energy": {
+      "max_abs": 0.3344713356345892,
+      "max_rel": 0.9494659146427868
+    },
+    "pce_h_after": {
+      "max_abs": 0.07059688121080399,
+      "max_rel": 0.6006675848896237
+    },
+    "pcs_h": {
+      "max_abs": 0.06605875492095947,
+      "max_rel": 0.2507691590499829
+    },
+    "pcs_y": {
+      "max_abs": 0.6144228875637054,
+      "max_rel": 0.7966306840543774
+    }
+  },
+  "jpc_vs_torch_native": {
+    "after_one_why": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "after_one_wxh": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "after_t50_why": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "after_t50_wxh": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "energy": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel": 3.9500902151229006e-07
+    },
+    "pcb_h": {
+      "max_abs": 4.470348358154297e-08,
+      "max_rel": 8.51201410497484e-07
+    },
+    "pce_h_after": {
+      "max_abs": 7.450580596923828e-09,
+      "max_rel": 1.324074346244912e-07
+    },
+    "pce_y_after": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel": 7.832643355780123e-08
+    },
+    "pcg_h": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel": 1.8063094388699728e-06
+    },
+    "pcg_y": {
+      "max_abs": 5.960464477539063e-08,
+      "max_rel": 9.983499770753886e-07
+    },
+    "pcs_h": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "pcs_y": {
+      "max_abs": 5.960464477539063e-08,
+      "max_rel": 9.983499770753886e-07
+    }
+  }
+}

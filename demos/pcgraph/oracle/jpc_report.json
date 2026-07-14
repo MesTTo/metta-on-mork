@@ -1,0 +1,28 @@
+{
+  "jpc_source": "/home/user/Dev/jpc",
+  "manual_vs_jpc": {
+    "energy": {
+      "max_abs": 1.4901161193847656e-08,
+      "max_rel": 3.9500902151229006e-07
+    },
+    "pce_h_after": {
+      "max_abs": 7.450580596923828e-09,
+      "max_rel": 1.324074346244912e-07
+    },
+    "pce_y_after": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    },
+    "pcg_h": {
+      "max_abs": 2.2351741790771484e-08,
+      "max_rel": 2.3404048666378795e-06
+    },
+    "pcg_y": {
+      "max_abs": 5.960464477539063e-08,
+      "max_rel": 4.991749885376943e-07
+    }
+  },
+  "output": "/home/user/Dev/metta-on-mork/demos/pcgraph/oracle/xor_jpc_reference.npz",
+  "reference": "jpc native ePC",
+  "topology": "2-2-2 one-hot XOR, matching jpc supervised example output conventions"
+}
