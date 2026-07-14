@@ -1,4 +1,5 @@
 .venv/
+scratch/bin/
 scratch/
 __pycache__/
 *.pyc
