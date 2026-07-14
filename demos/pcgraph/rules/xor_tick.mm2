@@ -1,0 +1,139 @@
+; One jpc-native ePC inner-loop tick for the fixed XOR chain.
+; The driver runs these hand-written blocks in marker order. The markers are
+; comments for MORK and section delimiters for driver.py.
+
+; %%PHASE P10_PREH
+(exec 10
+  (, (wxh $i $j $w) (phix $j $x))
+  (O (tensor-op-f32
+        (op einsum ab,b->a)
+        (inputs (wxh dense 2 2) (phix dense 2))
+        (output (preh dense))
+        (from (wxh $i $j $w) (phix $j $x))
+        (backend auto))))
+; %%END
+
+; %%PHASE P10_STATE
+(exec 11
+  (, (preh $i $p)
+     (eh $i $e))
+  (O (pure (pcs h $i $s) $s
+           (f32_to_string (sum_f32 (f32_from_string $p) (f32_from_string $e))))
+     (pure (sh $i $s) $s
+           (f32_to_string (sum_f32 (f32_from_string $p) (f32_from_string $e))))
+     (pure (pcphi h $i $phi) $phi
+           (f32_to_string (tanh_f32 (sum_f32 (f32_from_string $p) (f32_from_string $e)))))
+     (pure (phih $i $phi) $phi
+           (f32_to_string (tanh_f32 (sum_f32 (f32_from_string $p) (f32_from_string $e)))))))
+; %%END
+
+; %%PHASE P10_PREY
+(exec 12
+  (, (why $i $j $w) (phih $j $h))
+  (O (tensor-op-f32
+        (op einsum ab,b->a)
+        (inputs (why dense 2 2) (phih dense 2))
+        (output (prey dense))
+        (from (why $i $j $w) (phih $j $h))
+        (backend auto))))
+; %%END
+
+; %%PHASE P10_OUTPUT
+(exec 13
+  (, (prey $i $p)
+     (ey $i $e))
+  (O (pure (pcs y $i $s) $s
+           (f32_to_string (sub_f32 (f32_from_string $p) (f32_from_string $e))))
+     (pure (sy $i $s) $s
+           (f32_to_string (sub_f32 (f32_from_string $p) (f32_from_string $e))))))
+; %%END
+
+; %%PHASE P20_GY
+(exec 20
+  (, (yt $i $target)
+     (sy $i $s))
+  (O (pure (pcg y $i $g) $g
+           (f32_to_string (sub_f32 (f32_from_string $target) (f32_from_string $s))))
+     (pure (gy $i $g) $g
+           (f32_to_string (sub_f32 (f32_from_string $target) (f32_from_string $s))))))
+; %%END
+
+; %%PHASE P20_BACK
+(exec 21
+  (, (why $i $j $w) (gy $i $g))
+  (O (tensor-op-f32
+        (op einsum ab,a->b)
+        (inputs (why dense 2 2) (gy dense 2))
+        (output (backh dense))
+        (from (why $i $j $w) (gy $i $g))
+        (backend auto))))
+; %%END
+
+; %%PHASE P20_PCB
+(exec 22
+  (, (backh $i $b))
+  (O (+ (pcb h $i $b))
+     (+ (bh $i $b))))
+; %%END
+
+; %%PHASE P30_PHI2
+(exec 30
+  (, (phih $i $phi))
+  (O (pure (phi2h $i $phi2) $phi2
+           (f32_to_string
+             (product_f32 (f32_from_string $phi) (f32_from_string $phi))))))
+; %%END
+
+; %%PHASE P30_PRIME
+(exec 31
+  (, (phi2h $i $phi2)
+     (one $one))
+  (O (pure (primeh $i $prime) $prime
+           (f32_to_string
+             (sub_f32 (f32_from_string $one) (f32_from_string $phi2))))))
+; %%END
+
+; %%PHASE P30_BP
+(exec 32
+  (, (primeh $i $prime)
+     (bh $i $b))
+  (O (pure (bph $i $bp) $bp
+           (f32_to_string
+             (product_f32 (f32_from_string $prime) (f32_from_string $b))))))
+; %%END
+
+; %%PHASE P30_GH
+(exec 33
+  (, (eh $i $e)
+     (bph $i $bp))
+  (O (pure (pcg h $i $g) $g
+           (f32_to_string (sub_f32 (f32_from_string $e) (f32_from_string $bp))))
+     (pure (gh $i $g) $g
+           (f32_to_string (sub_f32 (f32_from_string $e) (f32_from_string $bp))))))
+; %%END
+
+; %%PHASE P40_EH
+(exec 40
+  (, (pchp error-lr $lr)
+     (pce h $i $old)
+     (gh $i $g))
+  (O (- (pce h $i $old))
+     (pure (pce h $i $new) $new
+           (f32_to_string
+             (sub_f32
+               (f32_from_string $old)
+               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))))
+; %%END
+
+; %%PHASE P40_EY
+(exec 41
+  (, (pchp error-lr $lr)
+     (pce y $i $old)
+     (gy $i $g))
+  (O (- (pce y $i $old))
+     (pure (pce y $i $new) $new
+           (f32_to_string
+             (sub_f32
+               (f32_from_string $old)
+               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))))
+; %%END
