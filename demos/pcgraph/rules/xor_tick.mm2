@@ -1,6 +1,115 @@
 ; One jpc-native ePC inner-loop tick for the fixed XOR chain.
-; The driver runs these hand-written blocks in marker order. The markers are
-; comments for MORK and section delimiters for driver.py.
+; The legacy driver runs these hand-written blocks in marker order. The
+; single-invocation driver turns the same blocks into phase facts and arms them
+; with quiesce barriers.
+
+; %%PHASE P00_CLEAR_PCS_H
+(exec 1
+  (, (pcs h $i $v))
+  (O (- (pcs h $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PCS_Y
+(exec 1
+  (, (pcs y $i $v))
+  (O (- (pcs y $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PCPHI_H
+(exec 1
+  (, (pcphi h $i $v))
+  (O (- (pcphi h $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PREH
+(exec 1
+  (, (preh $i $v))
+  (O (- (preh $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_SH
+(exec 1
+  (, (sh $i $v))
+  (O (- (sh $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PHIH
+(exec 1
+  (, (phih $i $v))
+  (O (- (phih $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PREY
+(exec 1
+  (, (prey $i $v))
+  (O (- (prey $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_SY
+(exec 1
+  (, (sy $i $v))
+  (O (- (sy $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_GY
+(exec 1
+  (, (gy $i $v))
+  (O (- (gy $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PCG_Y
+(exec 1
+  (, (pcg y $i $v))
+  (O (- (pcg y $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_BACKH
+(exec 1
+  (, (backh $i $v))
+  (O (- (backh $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PCB_H
+(exec 1
+  (, (pcb h $i $v))
+  (O (- (pcb h $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_BH
+(exec 1
+  (, (bh $i $v))
+  (O (- (bh $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PHI2H
+(exec 1
+  (, (phi2h $i $v))
+  (O (- (phi2h $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PRIMEH
+(exec 1
+  (, (primeh $i $v))
+  (O (- (primeh $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_BPH
+(exec 1
+  (, (bph $i $v))
+  (O (- (bph $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_PCG_H
+(exec 1
+  (, (pcg h $i $v))
+  (O (- (pcg h $i $v))))
+; %%END
+
+; %%PHASE P00_CLEAR_GH
+(exec 1
+  (, (gh $i $v))
+  (O (- (gh $i $v))))
+; %%END
 
 ; %%PHASE P10_PREH
 (exec 10
@@ -16,10 +125,13 @@
 ; %%PHASE P10_STATE
 (exec 11
   (, (preh $i $p)
-     (eh $i $e))
+     (eh $i $e)
+     (pctick $t))
   (O (pure (pcs h $i $s) $s
            (f32_to_string (sum_f32 (f32_from_string $p) (f32_from_string $e))))
      (pure (sh $i $s) $s
+           (f32_to_string (sum_f32 (f32_from_string $p) (f32_from_string $e))))
+     (pure (pcsh $t h $i $s) $s
            (f32_to_string (sum_f32 (f32_from_string $p) (f32_from_string $e))))
      (pure (pcphi h $i $phi) $phi
            (f32_to_string (tanh_f32 (sum_f32 (f32_from_string $p) (f32_from_string $e)))))
@@ -41,10 +153,13 @@
 ; %%PHASE P10_OUTPUT
 (exec 13
   (, (prey $i $p)
-     (ey $i $e))
+     (ey $i $e)
+     (pctick $t))
   (O (pure (pcs y $i $s) $s
            (f32_to_string (sub_f32 (f32_from_string $p) (f32_from_string $e))))
      (pure (sy $i $s) $s
+           (f32_to_string (sub_f32 (f32_from_string $p) (f32_from_string $e))))
+     (pure (pcsh $t y $i $s) $s
            (f32_to_string (sub_f32 (f32_from_string $p) (f32_from_string $e))))))
 ; %%END
 
@@ -112,13 +227,34 @@
            (f32_to_string (sub_f32 (f32_from_string $e) (f32_from_string $bp))))))
 ; %%END
 
+; %%PHASE P35_HIST_EH
+(exec 35
+  (, (pctick $t)
+     (pce h $i $e))
+  (O (+ (pceh $t h $i $e))))
+; %%END
+
+; %%PHASE P35_HIST_EY
+(exec 36
+  (, (pctick $t)
+     (pce y $i $e))
+  (O (+ (pceh $t y $i $e))))
+; %%END
+
 ; %%PHASE P40_EH
 (exec 40
   (, (pchp error-lr $lr)
      (pce h $i $old)
+     (eh $i $old)
      (gh $i $g))
   (O (- (pce h $i $old))
+     (- (eh $i $old))
      (pure (pce h $i $new) $new
+           (f32_to_string
+             (sub_f32
+               (f32_from_string $old)
+               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))
+     (pure (eh $i $new) $new
            (f32_to_string
              (sub_f32
                (f32_from_string $old)
@@ -129,9 +265,16 @@
 (exec 41
   (, (pchp error-lr $lr)
      (pce y $i $old)
+     (ey $i $old)
      (gy $i $g))
   (O (- (pce y $i $old))
+     (- (ey $i $old))
      (pure (pce y $i $new) $new
+           (f32_to_string
+             (sub_f32
+               (f32_from_string $old)
+               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))
+     (pure (ey $i $new) $new
            (f32_to_string
              (sub_f32
                (f32_from_string $old)
