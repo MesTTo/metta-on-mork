@@ -241,6 +241,38 @@
   (O (+ (pceh $t y $i $e))))
 ; %%END
 
+; %%PHASE P35_TRAIN_SH_H
+(exec 37
+  (, (pcupdate $u)
+     (pctick $t)
+     (sh $i $s))
+  (O (+ (pctrsh $u $t h $i $s))))
+; %%END
+
+; %%PHASE P35_TRAIN_SH_Y
+(exec 38
+  (, (pcupdate $u)
+     (pctick $t)
+     (sy $i $s))
+  (O (+ (pctrsh $u $t y $i $s))))
+; %%END
+
+; %%PHASE P35_TRAIN_EH
+(exec 39
+  (, (pcupdate $u)
+     (pctick $t)
+     (pce h $i $e))
+  (O (+ (pctreh $u $t h $i $e))))
+; %%END
+
+; %%PHASE P35_TRAIN_EY
+(exec 40
+  (, (pcupdate $u)
+     (pctick $t)
+     (pce y $i $e))
+  (O (+ (pctreh $u $t y $i $e))))
+; %%END
+
 ; %%PHASE P40_EH
 (exec 40
   (, (pchp error-lr $lr)
@@ -258,7 +290,239 @@
            (f32_to_string
              (sub_f32
                (f32_from_string $old)
-               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))))
+	               (product_f32 (f32_from_string $lr) (f32_from_string $g)))))))
+; %%END
+
+; %%PHASE P60_CLEAR_DWXH
+(exec 60
+  (, (dwxh $i $j $v))
+  (O (- (dwxh $i $j $v))))
+; %%END
+
+; %%PHASE P60_CLEAR_DWHY
+(exec 61
+  (, (dwhy $i $j $v))
+  (O (- (dwhy $i $j $v))))
+; %%END
+
+; %%PHASE P60_CLEAR_SDWXH
+(exec 62
+  (, (sdwxh $i $j $v))
+  (O (- (sdwxh $i $j $v))))
+; %%END
+
+; %%PHASE P60_CLEAR_SDWHY
+(exec 63
+  (, (sdwhy $i $j $v))
+  (O (- (sdwhy $i $j $v))))
+; %%END
+
+; %%PHASE P60_DWXH
+(exec 64
+  (, (eh $i $e)
+     (phix $j $x))
+  (O (tensor-op-f32
+        (op einsum a,b->ab)
+        (inputs (eh dense 2) (phix dense 2))
+        (output (dwxh dense 2 2))
+        (from (eh $i $e)
+              (phix $j $x))
+        (backend auto))))
+; %%END
+
+; %%PHASE P60_DWHY
+(exec 65
+  (, (gy $i $g)
+     (phih $j $h))
+  (O (tensor-op-f32
+        (op einsum a,b->ab)
+        (inputs (gy dense 2) (phih dense 2))
+        (output (dwhy dense 2 2))
+        (from (gy $i $g)
+              (phih $j $h))
+        (backend auto))))
+; %%END
+
+; %%PHASE P60_SCALE_DWXH
+(exec 66
+  (, (pchp weight-lr $lr)
+     (dwxh $i $j $d))
+  (O (pure (sdwxh $i $j $sd) $sd
+           (f32_to_string
+             (product_f32 (f32_from_string $lr) (f32_from_string $d))))))
+; %%END
+
+; %%PHASE P60_SCALE_DWHY
+(exec 67
+  (, (pchp weight-lr $lr)
+     (dwhy $i $j $d))
+  (O (pure (sdwhy $i $j $sd) $sd
+           (f32_to_string
+             (product_f32 (f32_from_string $lr) (f32_from_string $d))))))
+; %%END
+
+; %%PHASE P60_FOLD_WXH
+(exec 68
+  (, (wxh $i $j $w)
+     (sdwxh $i $j $dw))
+  (O (tensor-op-f32
+        (op add)
+        (inputs (wxh dense 2 2) (sdwxh dense 2 2))
+        (output (wxh dense 2 2))
+        (from (wxh $i $j $w)
+              (sdwxh $i $j $dw))
+        (backend auto))))
+; %%END
+
+; %%PHASE P60_FOLD_WHY
+(exec 69
+  (, (why $i $j $w)
+     (sdwhy $i $j $dw))
+  (O (tensor-op-f32
+        (op add)
+        (inputs (why dense 2 2) (sdwhy dense 2 2))
+        (output (why dense 2 2))
+        (from (why $i $j $w)
+              (sdwhy $i $j $dw))
+        (backend auto))))
+; %%END
+
+; %%PHASE P60_CLEAR_PCW_XH
+(exec 70
+  (, (pcw xh $i $j $w))
+  (O (- (pcw xh $i $j $w))))
+; %%END
+
+; %%PHASE P60_SYNC_PCW_XH
+(exec 71
+  (, (wxh $i $j $w))
+  (O (+ (pcw xh $i $j $w))))
+; %%END
+
+; %%PHASE P60_CLEAR_PCW_HY
+(exec 72
+  (, (pcw hy $i $j $w))
+  (O (- (pcw hy $i $j $w))))
+; %%END
+
+; %%PHASE P60_SYNC_PCW_HY
+(exec 73
+  (, (why $i $j $w))
+  (O (+ (pcw hy $i $j $w))))
+; %%END
+
+; %%PHASE P69_ADVANCE_TICK
+(exec 79
+  (, (pctick $tick)
+     (pcnext $tick $next))
+  (O (- (pctick $tick))
+     (+ (pctick $next))
+     (+ (pcadvanced $tick $next))))
+; %%END
+
+; %%PHASE P70_ADVANCE_UPDATE
+(exec 80
+  (, (pcupdate $u)
+     (pcnextupdate $u $next)
+     (pctick $t))
+  (O (- (pcupdate $u))
+     (+ (pcupdate $next))
+     (- (pctick $t))
+     (+ (pctick 0))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCIN_X
+(exec 81
+  (, (pcin x $i $v))
+  (O (- (pcin x $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCS_X
+(exec 82
+  (, (pcs x $i $v))
+  (O (- (pcs x $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCPHI_X
+(exec 83
+  (, (pcphi x $i $v))
+  (O (- (pcphi x $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PHIX
+(exec 84
+  (, (phix $i $v))
+  (O (- (phix $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCIN_Y
+(exec 85
+  (, (pcin y $i $v))
+  (O (- (pcin y $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_YT
+(exec 86
+  (, (yt $i $v))
+  (O (- (yt $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCE_H
+(exec 87
+  (, (pce h $i $v))
+  (O (- (pce h $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_EH
+(exec 88
+  (, (eh $i $v))
+  (O (- (eh $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_PCE_Y
+(exec 89
+  (, (pce y $i $v))
+  (O (- (pce y $i $v))))
+; %%END
+
+; %%PHASE P70_CLEAR_EY
+(exec 90
+  (, (ey $i $v))
+  (O (- (ey $i $v))))
+; %%END
+
+; %%PHASE P71_LOAD_X
+(exec 91
+  (, (pcupdate $u)
+     (pcupdate-sample $u $sample)
+     (pcx $sample $i $v))
+  (O (+ (pcin x $i $v))
+     (+ (pcs x $i $v))
+     (+ (pcphi x $i $v))
+     (+ (phix $i $v))))
+; %%END
+
+; %%PHASE P71_LOAD_Y
+(exec 92
+  (, (pcupdate $u)
+     (pcupdate-sample $u $sample)
+     (pcy $sample $i $v))
+  (O (+ (pcin y $i $v))
+     (+ (yt $i $v))))
+; %%END
+
+; %%PHASE P71_RESET_EH
+(exec 93
+  (, (pczero h $i $z))
+  (O (+ (pce h $i $z))
+     (+ (eh $i $z))))
+; %%END
+
+; %%PHASE P71_RESET_EY
+(exec 94
+  (, (pczero y $i $z))
+  (O (+ (pce y $i $z))
+     (+ (ey $i $z))))
 ; %%END
 
 ; %%PHASE P40_EY

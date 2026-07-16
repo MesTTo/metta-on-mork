@@ -19,6 +19,9 @@ SETTLE_STEPS = 16
 TRAIN_STEPS = 50
 ERROR_LR = np.float32(0.1)
 WEIGHT_LR = np.float32(0.001)
+LOCAL_WEIGHT_LR = np.float32(0.01)
+LOCAL_TRAIN_CRITERION = np.float32(0.15)
+LOCAL_TRAIN_MAX_UPDATES = 2000
 
 X_SINGLE = np.asarray([[0.0, 1.0]], dtype=np.float32)
 Y_SINGLE = np.asarray([[0.0, 1.0]], dtype=np.float32)
@@ -53,6 +56,15 @@ class Weights:
             f"{prefix}_wxh": self.wxh.astype(np.float32),
             f"{prefix}_why": self.why.astype(np.float32),
         }
+
+
+def load_jpc_reference() -> Tuple[np.lib.npyio.NpzFile, Weights]:
+    jpc_npz = np.load(ORACLE_DIR / "xor_jpc_reference.npz")
+    initial = Weights(
+        wxh=jpc_npz["initial_wxh"].astype(np.float32),
+        why=jpc_npz["initial_why"].astype(np.float32),
+    )
+    return jpc_npz, initial
 
 
 def as_float32(value: np.ndarray) -> np.ndarray:
@@ -227,6 +239,149 @@ def jpc_native_settle(
     error_lr: float = float(ERROR_LR),
 ) -> Dict[str, np.ndarray]:
     return error_settle(weights, x, y, "jpc-native", steps, error_lr)
+
+
+def jpc_native_settle_final(
+    weights: Weights,
+    x: np.ndarray,
+    y: np.ndarray,
+    steps: int = SETTLE_STEPS,
+    error_lr: float = float(ERROR_LR),
+) -> Dict[str, np.ndarray]:
+    e_h, e_y = zero_error_state(x.shape[0], include_output=True)
+    step: Dict[str, np.ndarray] | None = None
+    for _ in range(steps):
+        step = jpc_native_step(weights, x, y, e_h, e_y, error_lr)
+        e_h = step["pce_h_after"]
+        e_y = step["pce_y_after"]
+    if step is None:
+        raise ValueError("settle requires at least one step")
+    return step
+
+
+def local_weight_update(
+    weights: Weights,
+    x: np.ndarray,
+    step: Dict[str, np.ndarray],
+    weight_lr: float = float(LOCAL_WEIGHT_LR),
+) -> Tuple[Weights, Dict[str, np.ndarray]]:
+    lr = np.float32(weight_lr)
+    d_wxh = as_float32(step["pce_h_after"].T @ x)
+    d_why = as_float32(step["residual"].T @ step["phi_h"])
+    updated = Weights(
+        wxh=as_float32(weights.wxh + lr * d_wxh),
+        why=as_float32(weights.why + lr * d_why),
+    )
+    return updated, {"d_wxh": d_wxh, "d_why": d_why}
+
+
+def batch_settle_loss(weights: Weights) -> Tuple[np.ndarray, np.ndarray]:
+    step = jpc_native_settle_final(weights, X_TRAIN, Y_TRAIN)
+    return np.asarray(step["energy"], dtype=np.float32), step["pcs_y"]
+
+
+def training_sample_pair(sample_index: int) -> Tuple[np.ndarray, np.ndarray]:
+    start = sample_index
+    stop = start + 1
+    return X_TRAIN[start:stop], Y_TRAIN[start:stop]
+
+
+def _append_training_row(
+    rows: Dict[str, list[np.ndarray]],
+    update: int,
+    sample: int,
+    step: Dict[str, np.ndarray],
+    weights: Weights,
+) -> None:
+    batch_energy, batch_y = batch_settle_loss(weights)
+    rows["update"].append(np.asarray(update, dtype=np.int64))
+    rows["sample"].append(np.asarray(sample, dtype=np.int64))
+    rows["sample_energy"].append(np.asarray(step["energy"], dtype=np.float32))
+    rows["batch_energy"].append(np.asarray(batch_energy, dtype=np.float32))
+    rows["batch_pred"].append(np.asarray(batch_y, dtype=np.float32))
+    rows["wxh"].append(weights.wxh.copy())
+    rows["why"].append(weights.why.copy())
+
+
+def local_m1_update(
+    weights: Weights,
+    sample_index: int,
+    steps: int = SETTLE_STEPS,
+    weight_lr: float = float(LOCAL_WEIGHT_LR),
+) -> Tuple[Weights, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    x, y = training_sample_pair(sample_index)
+    step = jpc_native_settle_final(weights, x, y, steps)
+    updated, delta = local_weight_update(weights, x, step, weight_lr)
+    return updated, step, delta
+
+
+def local_m2_update(
+    current: Weights,
+    sample_index: int,
+    ticks: int = SETTLE_STEPS,
+    lr: float = float(LOCAL_WEIGHT_LR),
+) -> Tuple[Weights, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    x, y = training_sample_pair(sample_index)
+    e_h, e_y = zero_error_state(1, include_output=True)
+    step: Dict[str, np.ndarray] | None = None
+    delta: Dict[str, np.ndarray] | None = None
+    for _ in range(ticks):
+        step = jpc_native_step(current, x, y, e_h, e_y)
+        current, delta = local_weight_update(current, x, step, lr)
+        e_h = step["pce_h_after"]
+        e_y = step["pce_y_after"]
+    if step is None or delta is None:
+        raise ValueError("iPC update requires at least one settle step")
+    return current, step, delta
+
+
+def local_train_to_criterion(
+    initial: Weights,
+    mode: str,
+    max_updates: int = LOCAL_TRAIN_MAX_UPDATES,
+    criterion: float = float(LOCAL_TRAIN_CRITERION),
+    steps: int = SETTLE_STEPS,
+    weight_lr: float = float(LOCAL_WEIGHT_LR),
+) -> Dict[str, np.ndarray]:
+    if mode == "m1":
+        update_fn = local_m1_update
+    elif mode == "m2":
+        update_fn = local_m2_update
+    else:
+        raise ValueError(f"unknown local training mode: {mode}")
+
+    rows: Dict[str, list[np.ndarray]] = {
+        "update": [],
+        "sample": [],
+        "sample_energy": [],
+        "batch_energy": [],
+        "batch_pred": [],
+        "wxh": [],
+        "why": [],
+    }
+    current = initial
+    hit_update = None
+    for update in range(max_updates):
+        sample = update % X_TRAIN.shape[0]
+        current, step, _delta = update_fn(current, sample, steps, weight_lr)
+        _append_training_row(rows, update + 1, sample, step, current)
+        if hit_update is None and float(rows["batch_energy"][-1]) <= criterion:
+            hit_update = update + 1
+            break
+    if hit_update is None:
+        raise AssertionError(
+            f"{mode} did not reach criterion {criterion} within {max_updates} updates; "
+            f"last batch energy {float(rows['batch_energy'][-1])}"
+        )
+
+    result = {key: np.stack(value).astype(np.float32) for key, value in rows.items() if key not in {"update", "sample"}}
+    result["update"] = np.stack(rows["update"]).astype(np.int64)
+    result["sample"] = np.stack(rows["sample"]).astype(np.int64)
+    result["criterion_update"] = np.asarray(hit_update, dtype=np.int64)
+    result["criterion"] = np.asarray(criterion, dtype=np.float32)
+    result["weight_lr"] = np.asarray(weight_lr, dtype=np.float32)
+    result.update(current.as_npz("final"))
+    return result
 
 
 def paper_error_step(
