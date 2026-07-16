@@ -1,12 +1,14 @@
 # PC Graph Demo
 
-This directory covers Stage 1 chunks 1 through 3.
+This directory covers Stage 1 chunks 1 through 4.
 
 The verified network is a fixed `2-2-2` XOR chain with one-hot outputs, tanh on the hidden state, squared-error output loss, `error_lr = 0.1`, and `K = 16` inner error updates. The `2-2-2` shape follows jpc's supervised ePC convention, where output targets are vectors and `init_epc_errors([2, 2, 2], batch, "supervised")` creates hidden and output error variables.
 
-`oracle/xor_jpc_reference.npz` is the primary interchange artifact. It stores the seeded initial weights, one-sample settle traces for all `K` inner steps, the energy trajectory, weights after one full-XOR weight update, and weights after `T = 50` full-XOR training updates.
+`oracle/xor_jpc_reference.npz` is the primary interchange artifact. It stores the seeded initial weights, one-sample settle traces for all `K` inner steps, the energy trajectory, the m1 one-update reference, and the m1 XOR-to-criterion trajectory.
 
 `oracle/xor_error_based_reference.npz` is the Torch secondary artifact. It stores a Torch implementation of jpc-native ePC and a separate `error_based_PC` paper path. The paper path matches `PCE.E` and `PCE.y_pred` from `/home/user/Dev/error_based_PC`: only hidden errors are optimized, and the output residual stays inside the loss. That path diverges from jpc-native after the first step because jpc also updates an output error variable. The MORK gate follows jpc-native because chunk 1 makes jpc the primary reference.
+
+`oracle/xor_ipc_reference.npz` is the store-native iPC artifact. It uses the same local outer-product fold as m1, but applies it after every error tick. The update-every-tick rule is expected to diverge from m1 while keeping the same tensor shapes and the same XOR criterion.
 
 `driver.py` emits cells using the design schemas:
 
@@ -19,10 +21,17 @@ The verified network is a fixed `2-2-2` XOR chain with one-hot outputs, tanh on 
 - `(pchp <name> v)`
 - `(pcsh <tick> <node> i v)` for tick-indexed state history
 - `(pceh <tick> <node> i v)` for tick-indexed error history
+- `(pctrsh <update> <tick> <node> i v)` for training state history
+- `(pctreh <update> <tick> <node> i v)` for training error history
 
 The generated run files also contain fixed-chain helper relations such as `(wxh i j v)` and `(phix i v)` so the current tensor-op sink can consume dense tensors without symbolic edge labels. The public cells remain the gate surface.
 
-The MORK rules in `rules/xor_tick.mm2` use tensor-op sinks for the matrix-vector products and `pure` f32 calls for `tanh`, `tanh'`, scalar add, subtraction, and scaled error updates. The default driver path now emits one program and runs MORK once. It turns the checked-in phase blocks into phase facts, arms one `(exec (pcphase ...))`, and lets `(exec (quiesce ...))` barriers re-arm the next phase after the lower phase has stopped changing the store. The final barrier uses the in-store `pcnext` relation to advance `pctick`; when there is no successor for tick 15, the run ends with all 16 history rows in the dump.
+The MORK rules in `rules/xor_tick.mm2` use tensor-op sinks for the matrix-vector products, the local weight outer products, and the in-place elementwise weight folds. `pure` f32 calls handle `tanh`, `tanh'`, scalar add, subtraction, and scaled error updates. The default driver path now emits one program and runs MORK once. It turns the checked-in phase blocks into phase facts, arms one `(exec (pcphase ...))`, and lets `(exec (quiesce ...))` barriers re-arm the next phase after the lower phase has stopped changing the store. The settle barrier uses the in-store `pcnext` relation to advance `pctick`; when there is no successor for tick 15, m1 enters the P60 weight phase and m2 has already folded one local update per tick.
+
+Chunk 4 adds two learning modes:
+
+- m1 is the end-of-settle ePC update. After 16 settle ticks, P60 writes `dwxh` and `dwhy` with outer-product tensor ops, scales them by `(pchp weight-lr 0.01)`, folds them into `wxh` and `why` with in-place elementwise add, and syncs the public `pcw` mirror before the next example.
+- m2 is the store-native iPC update. It uses the same fold but fires it after every tick. The iPC reference is separate because this changes the trajectory by doctrine, not by implementation error.
 
 The old per-phase/per-tick path is still available through `driver.py --compare-legacy`. The checker uses it as a reference and asserts that its final public cells match the single-invocation path.
 
@@ -40,4 +49,4 @@ Run the checked path with:
 demos/pcgraph/.venv/bin/python demos/pcgraph/check_pcgraph.py
 ```
 
-The check regenerates oracle artifacts, runs the single-invocation settle, runs the legacy reference path, and writes `scratch/mork_gate_report.json`. On the verified run, the single path used 1 MORK invocation, the legacy path used 528, `pcsh` and `pceh` each contained 64 cells, and the final-cell max absolute difference between the two paths was `0.0`. The report contains the full 16-row energy table computed from the in-store history.
+The check regenerates oracle artifacts, runs the single-invocation settle, runs the legacy reference path, runs m1 and m2 XOR training, runs jscpd, and writes `scratch/mork_gate_report.json`. On the verified chunk-4 run, the settle path used 1 MORK invocation and the legacy path used 528. m1 reached the `0.15` XOR criterion in 1860 updates with final batch energy `0.14997369050979614`; m2 reached it in 92 updates with final batch energy `0.14927467703819275`. Both training modes ran as single MORK invocations. Timings in the report are provisional-under-load.
