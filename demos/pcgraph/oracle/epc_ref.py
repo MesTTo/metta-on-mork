@@ -24,6 +24,7 @@ from common import (
     make_trace,
     max_abs_rel,
     paper_error_settle,
+    load_jpc_reference,
     save_npz,
     stack_trace,
 )
@@ -104,11 +105,7 @@ def torch_train_steps(weights: Weights) -> Weights:
 
 
 def main() -> None:
-    jpc_npz = np.load(ORACLE_DIR / "xor_jpc_reference.npz")
-    initial = Weights(
-        wxh=jpc_npz["initial_wxh"].astype(np.float32),
-        why=jpc_npz["initial_why"].astype(np.float32),
-    )
+    jpc_npz, initial = load_jpc_reference()
     torch_native = torch_jpc_native_settle(initial, X_SINGLE, Y_SINGLE)
     numpy_native = jpc_native_settle(initial, X_SINGLE, Y_SINGLE)
     paper = paper_error_settle(initial, X_SINGLE, Y_SINGLE)

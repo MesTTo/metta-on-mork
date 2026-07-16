@@ -1,5 +1,8 @@
 {
   "jpc_source": "/home/user/Dev/jpc",
+  "local_learning_rule": "m1 uses jpc-native settling, then the store-native local outer product dW = eps_post x phi(pre) once at settle end.",
+  "local_m1_criterion_update": 1860,
+  "local_m1_final_batch_energy": 0.14997369050979614,
   "manual_vs_jpc": {
     "energy": {
       "max_abs": 1.4901161193847656e-08,

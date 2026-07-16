@@ -1,0 +1,7 @@
+{
+  "criterion_update": 92,
+  "final_batch_energy": 0.14927467703819275,
+  "output": "/home/user/Dev/metta-on-mork/demos/pcgraph/oracle/xor_ipc_reference.npz",
+  "reference": "store-native iPC",
+  "rule": "same local outer-product fold as m1, applied after every error tick"
+}

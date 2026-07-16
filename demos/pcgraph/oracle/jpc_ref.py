@@ -19,12 +19,17 @@ from common import (
     SETTLE_STEPS,
     TRAIN_STEPS,
     WEIGHT_LR,
+    LOCAL_TRAIN_CRITERION,
+    LOCAL_TRAIN_MAX_UPDATES,
+    LOCAL_WEIGHT_LR,
     X_SINGLE,
     X_TRAIN,
     Y_SINGLE,
     Y_TRAIN,
     Weights,
     jpc_native_settle,
+    local_m1_update,
+    local_train_to_criterion,
     max_abs_rel,
     save_npz,
 )
@@ -130,6 +135,8 @@ def main() -> None:
     one_update_model = update_params_once(model, X_TRAIN, Y_TRAIN)
     after_one = extract_weights(one_update_model)
     after_t50 = extract_weights(train_steps(model, TRAIN_STEPS))
+    local_after_one, local_step, local_delta = local_m1_update(initial, 0)
+    local_m1 = local_train_to_criterion(initial, "m1")
 
     out = ORACLE_DIR / "xor_jpc_reference.npz"
     save_npz(
@@ -137,6 +144,9 @@ def main() -> None:
         seed=np.asarray(SEED, dtype=np.int64),
         error_lr=np.asarray(ERROR_LR, dtype=np.float32),
         weight_lr=np.asarray(WEIGHT_LR, dtype=np.float32),
+        local_weight_lr=np.asarray(LOCAL_WEIGHT_LR, dtype=np.float32),
+        local_train_criterion=np.asarray(LOCAL_TRAIN_CRITERION, dtype=np.float32),
+        local_train_max_updates=np.asarray(LOCAL_TRAIN_MAX_UPDATES, dtype=np.int64),
         settle_steps=np.asarray(SETTLE_STEPS, dtype=np.int64),
         train_steps=np.asarray(TRAIN_STEPS, dtype=np.int64),
         x_single=X_SINGLE,
@@ -146,6 +156,10 @@ def main() -> None:
         **initial.as_npz("initial"),
         **after_one.as_npz("after_one_update"),
         **after_t50.as_npz("after_t50"),
+        **local_after_one.as_npz("local_m1_after_one"),
+        **{f"local_m1_first_{key}": value for key, value in local_step.items()},
+        **{f"local_m1_first_{key}": value for key, value in local_delta.items()},
+        **{f"local_m1_train_{key}": value for key, value in local_m1.items()},
         **{f"settle_{key}": value for key, value in manual.items()},
     )
     report_path = ORACLE_DIR / "jpc_report.json"
@@ -154,6 +168,12 @@ def main() -> None:
             {
                 "reference": "jpc native ePC",
                 "jpc_source": str(Path("/home/user/Dev/jpc").resolve()),
+                "local_learning_rule": (
+                    "m1 uses jpc-native settling, then the store-native local outer product "
+                    "dW = eps_post x phi(pre) once at settle end."
+                ),
+                "local_m1_criterion_update": int(local_m1["criterion_update"]),
+                "local_m1_final_batch_energy": float(local_m1["batch_energy"][-1]),
                 "topology": "2-2-2 one-hot XOR, matching jpc supervised example output conventions",
                 "manual_vs_jpc": {
                     key: {"max_abs": value[0], "max_rel": value[1]}
