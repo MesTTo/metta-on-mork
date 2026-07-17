@@ -1,6 +1,6 @@
 # PC Graph Demo
 
-This directory covers Stage 1 chunks 1 through 4.
+This directory covers Stage 1 chunks 1 through 5.
 
 The verified network is a fixed `2-2-2` XOR chain with one-hot outputs, tanh on the hidden state, squared-error output loss, `error_lr = 0.1`, and `K = 16` inner error updates. The `2-2-2` shape follows jpc's supervised ePC convention, where output targets are vectors and `init_epc_errors([2, 2, 2], batch, "supervised")` creates hidden and output error variables.
 
@@ -26,7 +26,7 @@ The verified network is a fixed `2-2-2` XOR chain with one-hot outputs, tanh on 
 
 The generated run files also contain fixed-chain helper relations such as `(wxh i j v)` and `(phix i v)` so the current tensor-op sink can consume dense tensors without symbolic edge labels. The public cells remain the gate surface.
 
-The MORK rules in `rules/xor_tick.mm2` use tensor-op sinks for the matrix-vector products, the local weight outer products, and the in-place elementwise weight folds. `pure` f32 calls handle `tanh`, `tanh'`, scalar add, subtraction, and scaled error updates. The default driver path now emits one program and runs MORK once. It turns the checked-in phase blocks into phase facts, arms one `(exec (pcphase ...))`, and lets `(exec (quiesce ...))` barriers re-arm the next phase after the lower phase has stopped changing the store. The settle barrier uses the in-store `pcnext` relation to advance `pctick`; when there is no successor for tick 15, m1 enters the P60 weight phase and m2 has already folded one local update per tick.
+The MORK rules in `rules/xor_tick.mm2` use tensor-op sinks for the matrix-vector products, the hidden `tanh`, the local weight outer products, and the in-place elementwise weight folds. `pure` f32 calls handle `tanh'`, scalar add, subtraction, and scaled error updates. The default driver path now emits one program and runs MORK once. It turns the checked-in phase blocks into phase facts, arms one `(exec (pcphase ...))`, and lets `(exec (quiesce ...))` barriers re-arm the next phase after the lower phase has stopped changing the store. The settle barrier uses the in-store `pcnext` relation to advance `pctick`; when there is no successor for tick 15, m1 enters the P60 weight phase and m2 has already folded one local update per tick.
 
 Chunk 4 adds two learning modes:
 
@@ -35,7 +35,36 @@ Chunk 4 adds two learning modes:
 
 The old per-phase/per-tick path is still available through `driver.py --compare-legacy`. The checker uses it as a reference and asserts that its final public cells match the single-invocation path.
 
-The chunk-3 run was verified with a local copy of the MORK binary built from `/home/user/Dev/mork-integration/MORK` on branch `einsum-port` at `63c4d213130e4444ace590d88300e29b748d2a16`, with features `einsum,leapfrog,bulk_emit,factorized_aggregate,stratified_quiescence` and `RUSTFLAGS='-C target-cpu=native -Awarnings'`. Before the pcgraph gate, that feature combination produced the required process-calculus dump SHA:
+Chunk 5 adds `derive_rules.py`. The tool reads the XOR chain forward spec and writes the MM2 phase blocks used by the driver. The checked-in `rules/xor_tick.mm2.handwritten` file is the chunk-4 reference copy for diffing.
+
+The default spec is embedded in `derive_rules.py` and can be replaced with `--spec path/to/spec.json`. The JSON shape is:
+
+```json
+{
+  "nodes": [
+    {"name": "x", "dim": 2, "role": "input"},
+    {"name": "h", "dim": 2, "role": "hidden", "activation": "tanh"},
+    {"name": "y", "dim": 2, "role": "output"}
+  ],
+  "edges": [
+    {"name": "xh", "src": "x", "dst": "h", "weight": "wxh", "pre": "preh", "src_activation": "phix", "forward": "ab,b->a"},
+    {"name": "hy", "src": "h", "dst": "y", "weight": "why", "pre": "prey", "src_activation": "phih", "forward": "ab,b->a"}
+  ],
+  "activation_lowering": "tensor-op-unary",
+  "error_distribution": "gaussian",
+  "output_family": "free-output-mse"
+}
+```
+
+The generator derives `ab,a->b` for hidden backpressure and `a,b->ab` for local weight deltas from each forward `ab,b->a` edge. The gaussian error family uses `psi(eps)=eps`, so the P30 hidden gradient is the current hidden error minus the activation-prime-scaled backpressure. The free-output family emits `sy = prey - ey` and `gy = target - sy`.
+
+Regenerate the checked-in rules with:
+
+```bash
+demos/pcgraph/.venv/bin/python demos/pcgraph/derive_rules.py --output demos/pcgraph/rules/xor_tick.mm2
+```
+
+The chunk-5 run was verified with a local copy of the MORK binary built from `/home/user/Dev/mork-integration/MORK` on branch `einsum-port` at `9c2b7c9e6a2072da9092cd452843e89a6295108d`, with features `einsum,leapfrog,bulk_emit,factorized_aggregate,stratified_quiescence` and `RUSTFLAGS='-C target-cpu=native -g -Awarnings'`. Before the pcgraph gate, that feature combination produced the required process-calculus dump SHA:
 
 ```text
 f88e8253c947b4f986d4c6a4acd40448408fdbf6effc3430174a67dccaca685e
@@ -49,4 +78,4 @@ Run the checked path with:
 demos/pcgraph/.venv/bin/python demos/pcgraph/check_pcgraph.py
 ```
 
-The check regenerates oracle artifacts, runs the single-invocation settle, runs the legacy reference path, runs m1 and m2 XOR training, runs jscpd, and writes `scratch/mork_gate_report.json`. On the verified chunk-4 run, the settle path used 1 MORK invocation and the legacy path used 528. m1 reached the `0.15` XOR criterion in 1860 updates with final batch energy `0.14997369050979614`; m2 reached it in 92 updates with final batch energy `0.14927467703819275`. Both training modes ran as single MORK invocations. Timings in the report are provisional-under-load.
+The check regenerates oracle artifacts, runs the single-invocation settle, runs the legacy reference path, runs m1 and m2 XOR training, runs jscpd, and writes `scratch/mork_gate_report.json`. On the verified chunk-5 run, the settle path used 1 MORK invocation and the legacy path used 560. The generated single program loaded 131 expressions. m1 reached the `0.15` XOR criterion in 1860 updates with final batch energy `0.14997369050979614`; m2 reached it in 92 updates with final batch energy `0.14927467703819275`. Both training modes ran as single MORK invocations. Timings in the report are provisional-under-load.

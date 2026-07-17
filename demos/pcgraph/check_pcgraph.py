@@ -138,7 +138,7 @@ def main() -> None:
             "--reporters",
             "ai",
             "--ignore",
-            ".venv/**,scratch/**,__pycache__/**,oracle/__pycache__/**",
+            ".venv/**,scratch/**,__pycache__/**,oracle/__pycache__/**,rules/*.handwritten",
             ".",
         ]
     )

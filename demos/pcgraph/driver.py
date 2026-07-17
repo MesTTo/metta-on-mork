@@ -29,9 +29,19 @@ from oracle.common import (
     local_train_to_criterion,
     max_abs_rel,
 )
+from derive_rules import (
+    BASE_PHASE_ORDER,
+    PHASE_ORDER,
+    POST_WEIGHT_TICK_PHASES,
+    RELOAD_PHASES,
+    TRAIN_HISTORY_PHASES,
+    TRAIN_PHASE_ORDER,
+    TRAIN_TICK_PHASE_ORDER,
+    WEIGHT_PHASES,
+)
 
 
-STRATIFIED_BIN = ROOT / "scratch" / "bin" / "mork-einsum-leapfrog-bulk-factorized-stratified"
+STRATIFIED_BIN = ROOT / "scratch" / "bin" / "mork-einsum-leapfrog-bulk-factorized-stratified-unary-9c2b7c9"
 DEFAULT_MORK_BIN = STRATIFIED_BIN if STRATIFIED_BIN.exists() else Path("/home/user/Dev/mork-integration/MORK/target/release/mork")
 MORK_BIN = Path(os.environ.get("MORK_BIN", DEFAULT_MORK_BIN))
 RULES_PATH = ROOT / "rules" / "xor_tick.mm2"
@@ -43,86 +53,6 @@ TRAIN_HISTORY_RE = re.compile(r"^\((pctrsh|pctreh) ([0-9]+) ([0-9]+) ([^ ]+) ([0
 LOADED_RE = re.compile(r"loaded ([0-9]+) expressions")
 PHASE_RE = re.compile(r"^; %%PHASE ([A-Z0-9_]+)$")
 PHASE_END = "; %%END"
-BASE_PHASE_ORDER = (
-    "P00_CLEAR_PCS_H",
-    "P00_CLEAR_PCS_Y",
-    "P00_CLEAR_PCPHI_H",
-    "P00_CLEAR_PREH",
-    "P00_CLEAR_SH",
-    "P00_CLEAR_PHIH",
-    "P00_CLEAR_PREY",
-    "P00_CLEAR_SY",
-    "P00_CLEAR_GY",
-    "P00_CLEAR_PCG_Y",
-    "P00_CLEAR_BACKH",
-    "P00_CLEAR_PCB_H",
-    "P00_CLEAR_BH",
-    "P00_CLEAR_PHI2H",
-    "P00_CLEAR_PRIMEH",
-    "P00_CLEAR_BPH",
-    "P00_CLEAR_PCG_H",
-    "P00_CLEAR_GH",
-    "P10_PREH",
-    "P10_STATE",
-    "P10_PREY",
-    "P10_OUTPUT",
-    "P20_GY",
-    "P20_BACK",
-    "P20_PCB",
-    "P30_PHI2",
-    "P30_PRIME",
-    "P30_BP",
-    "P30_GH",
-    "P35_HIST_EH",
-    "P35_HIST_EY",
-    "P40_EH",
-    "P40_EY",
-)
-TRAIN_HISTORY_PHASES = (
-    "P35_TRAIN_SH_H",
-    "P35_TRAIN_SH_Y",
-    "P35_TRAIN_EH",
-    "P35_TRAIN_EY",
-)
-WEIGHT_PHASES = (
-    "P60_CLEAR_DWXH",
-    "P60_CLEAR_DWHY",
-    "P60_CLEAR_SDWXH",
-    "P60_CLEAR_SDWHY",
-    "P60_DWXH",
-    "P60_DWHY",
-    "P60_SCALE_DWXH",
-    "P60_SCALE_DWHY",
-    "P60_FOLD_WXH",
-    "P60_FOLD_WHY",
-    "P60_CLEAR_PCW_XH",
-    "P60_SYNC_PCW_XH",
-    "P60_CLEAR_PCW_HY",
-    "P60_SYNC_PCW_HY",
-)
-POST_WEIGHT_TICK_PHASES = (
-    "P69_ADVANCE_TICK",
-)
-RELOAD_PHASES = (
-    "P70_ADVANCE_UPDATE",
-    "P70_CLEAR_PCIN_X",
-    "P70_CLEAR_PCS_X",
-    "P70_CLEAR_PCPHI_X",
-    "P70_CLEAR_PHIX",
-    "P70_CLEAR_PCIN_Y",
-    "P70_CLEAR_YT",
-    "P70_CLEAR_PCE_H",
-    "P70_CLEAR_EH",
-    "P70_CLEAR_PCE_Y",
-    "P70_CLEAR_EY",
-    "P71_LOAD_X",
-    "P71_LOAD_Y",
-    "P71_RESET_EH",
-    "P71_RESET_EY",
-)
-TRAIN_TICK_PHASE_ORDER = BASE_PHASE_ORDER[:-2] + TRAIN_HISTORY_PHASES + BASE_PHASE_ORDER[-2:]
-TRAIN_PHASE_ORDER = TRAIN_TICK_PHASE_ORDER + WEIGHT_PHASES + POST_WEIGHT_TICK_PHASES + RELOAD_PHASES
-PHASE_ORDER = BASE_PHASE_ORDER
 
 
 def f32(value: float) -> str:
@@ -356,14 +286,13 @@ def barrier_exec(phase: str, fact: str) -> str:
     return replace_head(fact, f"(exec (quiesce {phase_symbol(phase)})")
 
 
-def build_single_invocation_program(facts: str, phases: Dict[str, str], phase_order: Sequence[str] = BASE_PHASE_ORDER) -> str:
-    phase_facts = [phase_fact(phase, phases[phase]) for phase in phase_order]
-    barrier_facts = []
-    for index, phase in enumerate(phase_order):
-        next_phase = phase_order[index + 1] if index + 1 < len(phase_order) else None
-        barrier_facts.append(barrier_fact(phase, next_phase, phase_order))
-
-    first_phase = phase_order[0]
+def assemble_phase_program(
+    facts: str,
+    phases: Dict[str, str],
+    phase_facts: Sequence[str],
+    barrier_facts: Sequence[str],
+    first_phase: str,
+) -> str:
     program_parts = [
         facts,
         "\n".join(phase_facts),
@@ -372,6 +301,15 @@ def build_single_invocation_program(facts: str, phases: Dict[str, str], phase_or
         barrier_exec(first_phase, barrier_facts[0]),
     ]
     return "\n\n".join(part.strip() for part in program_parts) + "\n"
+
+
+def build_single_invocation_program(facts: str, phases: Dict[str, str], phase_order: Sequence[str] = BASE_PHASE_ORDER) -> str:
+    phase_facts = [phase_fact(phase, phases[phase]) for phase in phase_order]
+    barrier_facts = []
+    for index, phase in enumerate(phase_order):
+        next_phase = phase_order[index + 1] if index + 1 < len(phase_order) else None
+        barrier_facts.append(barrier_fact(phase, next_phase, phase_order))
+    return assemble_phase_program(facts, phases, phase_facts, barrier_facts, phase_order[0])
 
 
 def normal_barrier_fact(phase: str, next_phase: str) -> str:
@@ -493,15 +431,7 @@ def build_training_program(facts: str, phases: Dict[str, str]) -> str:
         else:
             barrier_facts.append(reload_tail_training_barrier_fact())
 
-    first_phase = TRAIN_TICK_PHASE_ORDER[0]
-    program_parts = [
-        facts,
-        "\n".join(phase_facts),
-        "\n".join(barrier_facts),
-        phase_exec(first_phase, phases[first_phase]),
-        barrier_exec(first_phase, barrier_facts[0]),
-    ]
-    return "\n\n".join(part.strip() for part in program_parts) + "\n"
+    return assemble_phase_program(facts, phases, phase_facts, barrier_facts, TRAIN_TICK_PHASE_ORDER[0])
 
 
 def parse_cells(dump: Path) -> Dict[Tuple[str, str, int], float]:
@@ -617,17 +547,20 @@ def history_counts(history: Dict[Tuple[str, int, str, int], float]) -> Dict[str,
     }
 
 
+def sample_energy(e_h: np.ndarray, pcs_y: np.ndarray, target: np.ndarray) -> np.float32:
+    residual = np.asarray(target, dtype=np.float32) - pcs_y
+    return np.float32(
+        0.5 * np.sum(e_h * e_h, dtype=np.float32)
+        + 0.5 * np.sum(residual * residual, dtype=np.float32)
+    )
+
+
 def history_energy_rows(history: Dict[Tuple[str, int, str, int], float], y: np.ndarray, steps: int) -> List[Dict[str, float]]:
     rows: List[Dict[str, float]] = []
     for tick in range(steps):
         pcs_y = get_history_vec(history, "pcsh", tick, "y")
         e_h = get_history_vec(history, "pceh", tick, "h")
-        residual = np.asarray(y, dtype=np.float32) - pcs_y
-        energy = np.float32(
-            0.5 * np.sum(e_h * e_h, dtype=np.float32)
-            + 0.5 * np.sum(residual * residual, dtype=np.float32)
-        )
-        rows.append({"tick": tick, "energy": float(energy)})
+        rows.append({"tick": tick, "energy": float(sample_energy(e_h, pcs_y, y))})
     return rows
 
 
@@ -649,12 +582,13 @@ def train_sample_energy_rows(
         sample = update % X_TRAIN.shape[0]
         pcs_y = get_train_history_vec(history, "pctrsh", update, tick, "y")
         e_h = get_train_history_vec(history, "pctreh", update, tick, "h")
-        residual = np.asarray(Y_TRAIN[sample : sample + 1], dtype=np.float32) - pcs_y
-        energy = np.float32(
-            0.5 * np.sum(e_h * e_h, dtype=np.float32)
-            + 0.5 * np.sum(residual * residual, dtype=np.float32)
+        rows.append(
+            {
+                "update": update + 1,
+                "sample": sample,
+                "sample_energy": float(sample_energy(e_h, pcs_y, Y_TRAIN[sample : sample + 1])),
+            }
         )
-        rows.append({"update": update + 1, "sample": sample, "sample_energy": float(energy)})
     return rows
 
 
