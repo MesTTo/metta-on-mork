@@ -13,6 +13,16 @@ costs, counts that never enumerate, and fixpoints that only re-derive the delta.
 below was measured on this machine against this exact tree (nightly Rust,
 `-C target-cpu=native`), with the command that reproduces it.
 
+## The transformer programme
+
+The main thing this substrate serves:
+[`metta-quantimork-transformer.pdf`](metta-quantimork-transformer.pdf), the technical report
+on GPT-2 (124M) re-expressed as a predictive-coding network by homotopy distillation, the
+measured rank concentration of its update mass, and the companion result running the same
+transformer's forward pass natively inside the MORK store (kernel lineage:
+[`metta-on-mork-base`](https://github.com/MesTTo/MORK/tree/metta-on-mork-base)). It is a
+work-in-progress report and states what is established and what is not.
+
 ## The MORK base
 
 This crate builds against **upstream [trueagi-io/MORK](https://github.com/trueagi-io/MORK)
@@ -370,15 +380,6 @@ proptest invariant holds every routed query equal to the raw matcher on every qu
   semi-naive fixpoints.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
-
-## The transformer programme
-
-[`metta-quantimork-transformer.pdf`](metta-quantimork-transformer.pdf) is the technical
-report on the programme this substrate serves: GPT-2 (124M) re-expressed as a
-predictive-coding network by homotopy distillation, the measured rank concentration of its
-update mass, and the companion result running the same transformer's forward pass natively
-inside the MORK store. It is a work-in-progress report and states what is established and
-what is not.
 
 ## License
 
