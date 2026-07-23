@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! MeTTa computation on MORK: load a forward-chaining `exec` rule, step MORK's MM2
 //! engine to fixpoint, and read the transitive closure back through the integration.
 //! This is the dream's computation engine (CeTTa's `mork:step!`) on the optimized

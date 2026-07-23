@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! Priority ordering for evaluation control (Hyperon issue #448).
 //!
 //! Grabbed from F1R3FLY MeTTaTron's `backend/eval/priority.rs` and ported to Hyperon

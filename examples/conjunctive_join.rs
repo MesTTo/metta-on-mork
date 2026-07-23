@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! The asymptotic case for native conjunctive queries: a 2-hop join
 //! `(, (edge $x $m) (edge $m $y))` over an N-edge chain.
 //!

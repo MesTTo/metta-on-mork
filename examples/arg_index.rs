@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! The asymptotic case for the argument-position index: the point query
 //! (edge $x nK) binds only the NON-leading argument, so the primary trie
 //! cannot seek it -- the matcher scans the whole relation, O(N). MorkSpace

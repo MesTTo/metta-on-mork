@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! Semi-naive MM2 fixpoint over a chain transitive closure.
 //!
 //! The control rule is the known IC scheduler shape from the MORK kernel tests:

@@ -3,6 +3,7 @@ name = "metta-on-mork"
 version = "0.1.0"
 edition = "2021"
 description = "MORK kernel as an in-process Hyperon atomspace backend (Space/SpaceMut)"
+license = "GPL-2.0-only"
 
 [dependencies]
 hyperon-atom = { path = "../hyperon-experimental/hyperon-atom" }

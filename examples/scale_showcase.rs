@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! Showcase: load far past the hyperon-experimental #1076 trie crash (~2k atoms)
 //! and run the first query, with timings. The default GroundingSpace trie panics
 //! on the first query after ~1.9-3k atoms; MorkSpace handles orders of magnitude

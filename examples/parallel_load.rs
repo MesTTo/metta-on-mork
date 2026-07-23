@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! Parallel bulk load on PathMap's own architecture: the trie is a prefix-
 //! partitioned structure of copy-on-write nodes, so per-thread private tries
 //! build without contention and merge by structural join (shared subtrees,

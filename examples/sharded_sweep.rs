@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! ShardZipper symbolic-CPU slice: hash-prefix-shard the atomspace and sweep all
 //! shards in parallel. Whole-space match-count of (edge $x $y) -- sequential on one
 //! trie vs across N shards in parallel (rayon).

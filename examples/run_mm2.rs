@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! Runs an MM2 program file on `MorkSpace`, the way `mork run <file>` does on the
 //! kernel binary, but purely through this crate's Space API: `add_sexpr_text` to
 //! load, `step` to run the exec scheduler to fixpoint, `count_matches` to inspect

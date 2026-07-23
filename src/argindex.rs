@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! The argument-position (column) index: a permuted-key secondary trie per
 //! (relation, argument position), so a single-factor query bound only on
 //! non-leading positions becomes a prefix seek instead of a relation scan --

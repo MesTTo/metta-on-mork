@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! The Send+Sync payoff: ONE MorkSpace shared by reference across threads.
 //! No snapshots, no copies -- queries are `&self`, atoms are Send+Sync on the
 //! thread-safe hyperon base, and every cache in the space is lock-based. Each

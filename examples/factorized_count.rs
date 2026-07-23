@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 MesTTo
 //! The asymptotic case for the factorized conjunctive count: counting the 2-hop
 //! join (, (edge $x $m) (edge $m $y)) over a K-K bipartite double star, whose
 //! output is K² while the store holds only 2K edges.
