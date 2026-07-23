@@ -77,6 +77,6 @@ identity); L6 should lift it from sink-side filter to join-side factor.
 
 `MORK_BIN=<kernel binary> python3 run_coverage.py 6 9` regenerates the
 baseline and subsumed programs, runs both on the kernel, and checks
-antichain coverage per stratum. The numbers in this report came from the
-ai-tmp working runs at Hf up to 12; the committed runner reproduces the
+antichain coverage per stratum. The numbers in this report came from
+working runs at Hf up to 12; the committed runner reproduces the
 mechanism and coverage law at any Hf you give it (time grows with Hf).
