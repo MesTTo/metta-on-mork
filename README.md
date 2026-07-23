@@ -356,8 +356,6 @@ every routed query equal to the raw matcher on every query shape.
 
 ## Limitations
 
-- `MorkSpace` is `Send + Sync` on the `send-sync-atoms` hyperon branch; sharing gives reader
-  parallelism (`query` is `&self`), mutation needs `&mut` or an outer lock.
 - Immutable grounded atoms are content-addressed by display string; mutable ones (`State`)
   are stored by per-instance identity and matched by current live value. Snapshots and
   sharded spaces carry no grounded registry, so they are for immutable content-addressed
