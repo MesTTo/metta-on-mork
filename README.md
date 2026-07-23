@@ -156,6 +156,43 @@ default path by the kernel's own differentials:
 | `factorized-aggregate` | COUNT/SUM/MIN/MAX/AND fold the join instead of enumerating it | [PR #130](https://github.com/trueagi-io/MORK/pull/130) |
 | `guarded-emit`, `retrieval-join`, `bulk-emit`, `witness-select` | sink-side output filtering, unifiability retrieval joins, sorted batch emission, witness selection | [`metta-on-mork-base`](https://github.com/MesTTo/MORK/tree/metta-on-mork-base), not yet PR'd |
 
+## The MM2 execution model
+
+MM2 is the kernel's own rewrite language, the layer the demos and `reduce()` run on. It has
+one construct, `exec`:
+
+```
+(exec SYSTEM (, PATTERNS) (, TEMPLATES))
+```
+
+Each step selects the highest-priority `exec`, matches the conjunction of PATTERNS against the
+space, writes TEMPLATES into it, and consumes the `exec` — whether or not anything matched.
+SYSTEM sets the priority, an expression-preferring shortlex order:
+
+| comparing | higher priority |
+|---|---|
+| expression vs symbol | the expression |
+| two expressions | the lower arity |
+| two symbols | the shorter; ties break lexicographically by ASCII |
+| all equal | a fixed, non-random order |
+
+The demos stage saturation phases with integer-led SYSTEM tags (`(exec (0 ...))`,
+`(exec (1 ...))`, ...). Everything reduces to MeTTa's `match` plus space mutation:
+
+| MM2 | MeTTa |
+|---|---|
+| `(exec S (, P) (, T))` | `(match &S (, P) (superpose (add-atom &self T)))` |
+| sink `(exec S (, P) (O (+ pos) (- neg)))` | `(match &S (, P) (add-atom &self pos))` and `(match &S (, P) (remove-atom &self neg))` |
+
+There is no built-in function application; it is pattern matching (match an arrow-typed fact
+and its argument to produce the result). The one performance lever is conjunct order: PATTERNS
+is matched left to right, so put the smallest-fanout pattern first.
+
+This is the **kernel lane** — the kernel's rewrite loop run directly, where grounded
+operations come from the pure-sink registry rather than a stdlib. The **interpreter lane** is
+the other entry point: the full MeTTa language with MorkSpace underneath, running hyperon's
+stdlib and scripts suite byte-identically (the differential sections below).
+
 ## MeTTa evaluation on the kernel
 
 `reduce(expr, fuel)` runs evaluation itself as MM2 exec rewriting inside an O(1) fork of the
