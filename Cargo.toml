@@ -25,7 +25,7 @@ default = []
 # to the default path by the kernel's own differentials; they change complexity,
 # not answers. semi-naive, leapfrog, and factorized-aggregate resolve against
 # the open-PR kernel base; guarded-emit, retrieval-join, bulk-emit, and
-# witness-select need the fork's private kernel lineage until their PRs land.
+# witness-select need the fork's metta-on-mork-base branch until their PRs land.
 semi-naive = ["mork/semi_naive_ic"]          # metta_calculus fixpoints match only the delta per round
 leapfrog = ["mork/leapfrog"]                 # flat conjunctive exec bodies route to the WCO leapfrog join
 factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exec sinks without enumerating the join

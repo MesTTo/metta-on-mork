@@ -21,9 +21,9 @@ Every number below was measured on this machine against this exact tree (nightly
 ## The MORK base
 
 This crate builds against **upstream [trueagi-io/MORK](https://github.com/trueagi-io/MORK)
-main with the full set of open MesTTo PRs merged** (27 at this writing, all public on the
-upstream tracker; merging them onto main reconstructs the base, kept here as the local
-branch `upstream-plus-prs`), on clean upstream
+main with the full set of open MesTTo PRs merged** (27 at this writing;
+[`upstream-plus-prs`](https://github.com/MesTTo/MORK/tree/upstream-plus-prs) on the
+MesTTo/MORK fork is that merge), on clean upstream
 [PathMap](https://github.com/Adam-Vandervorst/PathMap). Upstream-plus-PRs is the semantically
 accurate kernel; the deeper private-fork optimizations return here either as opt-in features
 or as bridge-level machinery in this crate. The hyperon dependency
@@ -384,8 +384,10 @@ Set `MORK_BIN` to a MORK kernel binary built with
 with python3; each REPORT.md records the measured numbers and the honest
 scope of its claim. Of these features, `semi_naive_ic` and `leapfrog` are in
 the open PR set; `stratified_quiescence`, `guarded_emit`, `retrieval_join`,
-and `witness_select` are private-fork features not yet PR'd upstream, so
-reproducing those drivers today takes a kernel built from that lineage. The
+and `witness_select` are fork features not yet PR'd upstream. Branch
+[`metta-on-mork-base`](https://github.com/MesTTo/MORK/tree/metta-on-mork-base)
+of the fork carries the full lineage (a superset of `upstream-plus-prs`), and
+a kernel built from it with the features above reproduces every driver. The
 MM2 semantics these programs rely on
 is the one LeaTTa's `morkEncodedSpaceBackend` law pins operationally: the
 serial fold over the encoded space, with every fast path byte-identical to
