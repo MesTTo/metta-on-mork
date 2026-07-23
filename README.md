@@ -21,8 +21,9 @@ Every number below was measured on this machine against this exact tree (nightly
 ## The MORK base
 
 This crate builds against **upstream [trueagi-io/MORK](https://github.com/trueagi-io/MORK)
-main with the full set of 28 open MesTTo PRs merged** (branch `upstream-plus-prs` of the
-[MesTTo/MORK](https://github.com/MesTTo/MORK) fork), on clean upstream
+main with the full set of open MesTTo PRs merged** (27 at this writing, all public on the
+upstream tracker; merging them onto main reconstructs the base, kept here as the local
+branch `upstream-plus-prs`), on clean upstream
 [PathMap](https://github.com/Adam-Vandervorst/PathMap). Upstream-plus-PRs is the semantically
 accurate kernel; the deeper private-fork optimizations return here either as opt-in features
 or as bridge-level machinery in this crate. The hyperon dependency
@@ -361,11 +362,31 @@ and small-table retrieval joins.
   subsumption. `run_coverage.py` regenerates programs, runs both closures,
   and checks the antichain coverage law at any Hf; REPORT.md records the
   measured 310.5s -> 377ms at Hf=12 from the working runs.
+- `demos/exphalving`: exponent halving on the meet-in-the-middle metamath
+  prover. Moving the meet point deeper into the forward antichain collapses
+  the searched `sol` state space, because the forward side stays an
+  antichain under subsumption while the backward side branches: jarr
+  1,294 -> 83 states (15.6x), imim1 6,108 -> 918 (6.7x), loowoz 25,501 -> 2,170
+  (11.8x). Every proof is independently type-checked against the three
+  axioms by `verify_proof.py`, which never consults the search and rejects a
+  corrupted proof as its negative control. The forward antichain is
+  target-independent (one shared lemma base for every theorem) and only
+  affordable because the sink route rides semi-naive and the WCO join (the
+  closure itself went 7.0s -> 0.10s in the same session). Two harder targets
+  in the working set (loolin, pm2.83) do not bisect at the meet points tried
+  and return no proof, which REPORT.md records as a property of
+  bidirectional search rather than an engine limitation; this is a
+  base-and-constant win on real instances, not a complexity-class change.
 
 Set `MORK_BIN` to a MORK kernel binary built with
 `--features semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,retrieval_join`
-and run any driver with python3; each REPORT.md records the measured numbers
-and the honest scope of its claim. The MM2 semantics these programs rely on
+(`demos/exphalving` additionally needs `witness_select`) and run any driver
+with python3; each REPORT.md records the measured numbers and the honest
+scope of its claim. Of these features, `semi_naive_ic` and `leapfrog` are in
+the open PR set; `stratified_quiescence`, `guarded_emit`, `retrieval_join`,
+and `witness_select` are private-fork features not yet PR'd upstream, so
+reproducing those drivers today takes a kernel built from that lineage. The
+MM2 semantics these programs rely on
 is the one LeaTTa's `morkEncodedSpaceBackend` law pins operationally: the
 serial fold over the encoded space, with every fast path byte-identical to
 the reference matcher.
