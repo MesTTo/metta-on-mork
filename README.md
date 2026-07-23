@@ -27,6 +27,7 @@ Rust, `-C target-cpu=native`), with the command that reproduces it.
 | **954 ms** | 2-hop conjunctive query at 512k atoms, output-linear where GroundingSpace panics at 2k (#1076) |
 | **94 ms** | `bfc-xp` jarr proof search, against the 40.4 s upstream quote |
 | **121/121** | chaining `.metta` programs running on MorkSpace, 120 proven equivalent by tier |
+| **27/27** | hyperon's stdlib and scripts test suite, byte-identical with the stdlib hosted in-store |
 | **6.06e-6** | max relative logit error of the 12-layer GPT-2 forward running inside the store |
 
 ## The transformer programme
@@ -231,6 +232,17 @@ measured a 16× parallel-load regression for an ordering MeTTa leaves unspecifie
 processes disagree with each other on 8 of its 69 proofs, and MorkSpace's difference sits in
 that same noise class, proof counts agreeing. The correctness work costs about half a
 microsecond on a warm point query and nothing on the fast paths.
+
+### The hyperon stdlib suite, byte-identically
+
+Hyperon's own stdlib regression corpus (`lib/tests/test_stdlib.metta` and all 26
+`python/tests/scripts/*.metta` files: spaces, mutable states, module imports,
+nondeterminism, the typed scripts, docs) runs through the same harness in its full-mork
+configuration, where the stdlib itself is loaded into MorkSpace, so every stdlib lookup is a
+store query. All 27 files produce byte-identical stdout against a stock GroundingSpace run
+of the same file (`chaining_sweep <file.metta> <grounding|mork>`, diff the two): every
+assertion in hyperon's suite passes identically over the store, with no normalization tier
+needed. The DAS integration tests are excluded; they need an external service.
 
 ## Against stock GroundingSpace
 
