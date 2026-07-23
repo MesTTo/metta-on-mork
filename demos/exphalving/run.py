@@ -49,7 +49,23 @@ def run(stem):
     return sol, wall, dump
 
 
+def build_act_tables():
+    """Build the fromNumber and lte ACT tables the mitm programs read.
+
+    The kernel materializes ACTs under /dev/shm (its ACT_PATH), so the two
+    generators write /dev/shm/fromNumber.act and /dev/shm/lte.act. gen-lte
+    reads fromNumber, so the order matters. Both are vendored from
+    trueagi-io/chaining (Nil Geisweiller); see their file headers.
+    """
+    for gen in ("gen-fromNumber", "gen-lte"):
+        subprocess.run(
+            [MORK, "run", str(ROOT / f"{gen}.mm2"), str(ROOT / f"{gen}.dump")],
+            check=True, capture_output=True,
+        )
+
+
 def main():
+    build_act_tables()
     print(f"{'target':8} {'D':>3}  {'original states':>16}  {'rebalanced states':>18}  "
           f"{'collapse':>9}  proof")
     for target, d, orig, bal in CASES:

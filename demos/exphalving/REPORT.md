@@ -59,7 +59,11 @@ that, a deeper forward table cost more than it saved.
 
 `MORK_BIN=<kernel built with witness_select> python3 run.py`. The kernel
 features needed: `semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,
-retrieval_join,witness_select`. `rebalance_meet.py` regenerates a rebalanced
+retrieval_join,witness_select`. `run.py` first builds the `fromNumber` and
+`lte` ACT tables the programs read, from the two generators vendored out of
+trueagi-io/chaining (author Nil Geisweiller, GPL-3.0; see their file
+headers); the kernel materializes ACTs under `/dev/shm`, so that step is
+Linux-specific. `rebalance_meet.py` regenerates a rebalanced
 program from a base MITM program and a forward-antichain dump;
 `verify_proof.py` type-checks any dump's finals against the axioms and has a
 negative control (a corrupted proof is rejected).
