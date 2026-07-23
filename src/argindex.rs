@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! The argument-position (column) index: a permuted-key secondary trie per
 //! (relation, argument position), so a single-factor query bound only on

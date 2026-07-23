@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! Priority ordering for evaluation control (Hyperon issue #448).
 //!

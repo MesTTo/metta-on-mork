@@ -486,7 +486,7 @@ query shape.
 
 ## License
 
-GPL-2.0-only (`SPDX-License-Identifier: GPL-2.0-only`), Copyright (C) 2026 MesTTo. See
+GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`), Copyright (C) 2026 MesTTo. See
 [LICENSE](LICENSE); each source file carries an SPDX header and copyright notice. Revisions
 before the relicense commit were MIT and keep that grant. The dependencies keep their own
 licenses: Hyperon (`hyperon-atom`, `hyperon-space`, `hyperon-common`) and MORK/PathMap.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! MeTTa computation on MORK: load a forward-chaining `exec` rule, step MORK's MM2
 //! engine to fixpoint, and read the transitive closure back through the integration.

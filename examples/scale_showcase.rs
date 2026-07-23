@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! Showcase: load far past the hyperon-experimental #1076 trie crash (~2k atoms)
 //! and run the first query, with timings. The default GroundingSpace trie panics

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! Is MorkSpace's query cost per-query or a cold first-query (COW) artifact?
 //! Load 500k, then time successive queries.

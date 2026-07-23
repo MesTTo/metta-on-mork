@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! The rule-rich fixpoint where semi-naive stepping earns its exponent: the
 //! kernel's process_calculus dish (rho-style message passing computing Peano

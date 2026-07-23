@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! Parallel concurrent queries on a MORK-backed space. MORK's PathMap is Send+Sync,
 //! so one shared space serves many querying threads at once -- the parallelism that

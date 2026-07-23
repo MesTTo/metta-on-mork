@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! The asymptotic case for the factorized conjunctive count: counting the 2-hop
 //! join (, (edge $x $m) (edge $m $y)) over a K-K bipartite double star, whose

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! MeTTa-On-Mork showcase: Hyperon's MeTTa, on the MORK kernel.
 //! Scale, indexed query, real MM2 forward-chaining computation, and data-parallel

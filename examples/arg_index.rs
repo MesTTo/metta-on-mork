@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! The asymptotic case for the argument-position index: the point query
 //! (edge $x nK) binds only the NON-leading argument, so the primary trie

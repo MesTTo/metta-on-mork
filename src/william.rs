@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! WILLIAM's compression-gain index and frequent-subpattern report (whitepaper
 //! 5.12), carried by this crate.

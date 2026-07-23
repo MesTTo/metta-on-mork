@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! The asymptotic case for query tabling: a variable-functor pattern
 //! ($x mid $y) defeats both the trie's prefix descent and the column index

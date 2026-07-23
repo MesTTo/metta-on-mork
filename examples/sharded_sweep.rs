@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 MesTTo
 //! ShardZipper symbolic-CPU slice: hash-prefix-shard the atomspace and sweep all
 //! shards in parallel. Whole-space match-count of (edge $x $y) -- sequential on one
