@@ -2,20 +2,15 @@
 
 MeTTa-on-MORK runs a Hyperon atomspace directly on the MORK kernel. `MorkSpace` implements
 Hyperon's `Space` and `SpaceMut` traits over MORK's PathMap byte-trie and its multi-pattern
-matcher, so a MeTTa program evaluates against MORK in the same process, with no network hop and
-no serialization boundary between the language and its store.
+matcher, so a MeTTa program evaluates against MORK in the same process, with no network hop
+and no serialization boundary between the language and its store.
 
-## Why this matters
-
-The reason to build this is scale: making the size of the knowledge base stop being the thing
-that decides what you can attempt. Stock Hyperon's `GroundingSpace` slows down under load and,
-past about 2,000 atoms, its trie index panics outright on an ordinary conjunctive query
-(hyperon-experimental #1076 — reproduced in this repo, see below). The wins that matter at
-scale are asymptotic, not constant-factor, and that is what this bridge goes after: queries
-that seek instead of scan, joins that cost what their output costs, counts that never
-enumerate, and fixpoints that only re-derive the delta.
-
-Every number below was measured on this machine against this exact tree (nightly Rust,
+The reason to build this is scale. Stock `GroundingSpace` slows under load and, past about
+2,000 atoms, its trie index panics outright on an ordinary conjunctive query
+(hyperon-experimental #1076, reproduced below). The wins that matter at scale are asymptotic,
+not constant-factor: queries that seek instead of scan, joins that cost what their output
+costs, counts that never enumerate, and fixpoints that only re-derive the delta. Every number
+below was measured on this machine against this exact tree (nightly Rust,
 `-C target-cpu=native`), with the command that reproduces it.
 
 ## The MORK base
@@ -24,38 +19,30 @@ This crate builds against **upstream [trueagi-io/MORK](https://github.com/trueag
 main with the full set of open MesTTo PRs merged** (27 at this writing;
 [`upstream-plus-prs`](https://github.com/MesTTo/MORK/tree/upstream-plus-prs) on the
 MesTTo/MORK fork is that merge), on clean upstream
-[PathMap](https://github.com/Adam-Vandervorst/PathMap). Upstream-plus-PRs is the semantically
-accurate kernel; the deeper private-fork optimizations return here either as opt-in features
-or as bridge-level machinery in this crate. The hyperon dependency
+[PathMap](https://github.com/Adam-Vandervorst/PathMap). The hyperon dependency
 (`../hyperon-experimental`) must be on its `send-sync-atoms` branch, which makes atoms and
-spaces thread-safe (`GroundedAtom: Send + Sync`, lock-based `Shared`/`SpaceCommon`/`DynSpace`)
-with hyperon's full workspace suite passing — the refactor upstream issue #410 asks for.
+spaces thread-safe with hyperon's full workspace suite passing — the refactor upstream issue
+#410 asks for.
 
 The kernel's complexity opt-ins pass through as cargo features, each byte-identical to the
-default path by the kernel's own differential suites:
+default path by the kernel's own differentials:
 
-- `semi-naive` — `metta_calculus` fixpoints match only each round's delta. Measured here on a
-  chain transitive closure (`cargo run --release --features semi-naive --example
-  semi_naive_step`): 3–6× (104.7 s naive → 30.1 s at N=800), bounded on that shape by its
-  quadratic output, which both paths must insert; PR #128's own workload shows the redundancy
-  the delta removes (98.8% of naive match candidates on `process_calculus`, 201,401
-  unifications naive against 2,377).
+- `semi-naive` — `metta_calculus` fixpoints match only each round's delta (PR #128): 3–6× on
+  a chain transitive closure here (104.7 s → 30.1 s at N=800); the PR's own workload counts
+  98.8% of naive match candidates as redundant (201,401 unifications → 2,377).
 - `leapfrog` — flat conjunctive exec bodies route through the worst-case-optimal
   leapfrog-unification join (PR #124).
-- `factorized-aggregate` — COUNT/SUM/MIN/MAX/AND exec sinks fold the join instead of
-  enumerating it (PR #130), and this crate's conjunctive `count_matches` rides the same
-  engine (below).
+- `factorized-aggregate` — COUNT/SUM/MIN/MAX/AND sinks fold the join instead of enumerating
+  it (PR #130); this crate's conjunctive `count_matches` rides the same engine.
 
 ## Asymptotics at the bridge
 
 ### Conjunctive queries are native worst-case-optimal joins
 
-`Space::query`'s contract admits sub-queries glued by the comma symbol. MorkSpace encodes each
-conjunct of `(, q1 .. qn)` as its own factor of one kernel multi-pattern query, so a variable
-shared across conjuncts becomes a join variable the worst-case-optimal join matches natively —
-instead of the per-conjunct query-and-thread fold an interpreter pays, with its
-intermediate-product blowup. The 2-hop join `(, (edge $x $m) (edge $m $y))` over an N-edge
-chain (`cargo run --release --example conjunctive_join`):
+Each conjunct of `(, q1 .. qn)` becomes one factor of a single kernel multi-pattern query, so
+a variable shared across conjuncts is a join variable the WCO join matches natively. The
+2-hop join `(, (edge $x $m) (edge $m $y))` over an N-edge chain
+(`cargo run --release --example conjunctive_join`):
 
 | N | GroundingSpace | MorkSpace |
 |---|---|---|
@@ -65,21 +52,17 @@ chain (`cargo run --release --example conjunctive_join`):
 | 32,000 | panics | 53.5 ms |
 | 512,000 | panics | 954 ms |
 
-MorkSpace is output-linear across the whole range (1024× the edges, 1029× the time). The same
-ordinary conjunctive query is a faithful reproduction of hyperon-experimental #1076:
-GroundingSpace's trie index panics from 2,000 atoms on. Results are asserted identical below
-the panic threshold, and a randomized differential seals the conjunction semantics against
-GroundingSpace's fold — the same equivalence LeaTTa 1.0.8 states as its encoded-backend
-conjunctive-query law.
+MorkSpace is output-linear across the range (1024× the edges, 1029× the time); the same query
+is a faithful #1076 reproduction. Results are asserted identical below the panic threshold,
+and a randomized differential seals the conjunction semantics against GroundingSpace's fold —
+the equivalence LeaTTa 1.0.8 states as its encoded-backend conjunctive-query law.
 
 ### Selective queries seek a column index instead of scanning
 
-A query bound only on a non-leading argument — `(edge $x nK)` — defeats the trie's prefix
-descent, so the matcher scans the relation. MorkSpace maintains a permuted-key
-argument-position index per (relation, arity, position), built on first use, invalidated in
-O(1) by a mutation generation counter, and admitted on the fork's proven fragment (ground
-functor, each argument a fresh variable or fully ground, repeated variables declined). This is
-the clause index MeTTaLingo ships, ported from the optimized fork
+A query bound only on a non-leading argument (`(edge $x nK)`) defeats prefix descent, so the
+matcher scans. MorkSpace keeps a permuted-key argument-position index per (relation, arity,
+position): built on first use, O(1)-invalidated by a mutation generation, maintained
+incrementally across adds and removes, admitted on the proven fragment
 (`cargo run --release --example arg_index`):
 
 | N | matcher scan | steady indexed query | ratio |
@@ -88,20 +71,16 @@ the clause index MeTTaLingo ships, ported from the optimized fork
 | 400,000 | 16.9 ms | 822 ns | 20,539× |
 | 1,600,000 | 60.4 ms | 742 ns | 81,415× |
 
-The scan grows linearly; the steady indexed query does not grow at all. The one O(N) build
-(409 ms at 1.6M) amortizes over every query — and mutations maintain the index incrementally
-(one O(1) permuted-key update per add/remove of the relation's facts) instead of invalidating
-it, so interleaved add/query workloads keep seeking. Snapshots carry the fresh indexes as
-copy-on-write clones: a `Send + Sync` `MorkSnapshot` answers the same selective query in
-~780 ns at every measured N, so parallel workers seek too.
+The scan grows linearly; the steady seek does not grow at all, and the one O(N) build (409 ms
+at 1.6M) amortizes over every query. Snapshots carry the indexes as copy-on-write clones and
+answer in ~780 ns at every measured N, so parallel workers seek too.
 
 ### Conjunctive counts never enumerate the join
 
-With the `factorized-aggregate` feature, `count_matches` on a conjunctive query folds the join
-over its hypertree decomposition (`mork::ghd`, PR #130): O(N^fhtw) against the enumeration's
-O(join output) — an exponent drop, not a factor. Counting the 2-hop join over a K+K double
-star whose output is K² (`cargo run --release --features factorized-aggregate --example
-factorized_count`):
+With `factorized-aggregate`, `count_matches` folds the join over its hypertree decomposition
+(`mork::ghd`): O(N^fhtw) against the enumeration's O(join output). Counting the 2-hop join
+over a K+K double star whose output is K²
+(`cargo run --release --features factorized-aggregate --example factorized_count`):
 
 | K | join output | enumerate | factorized count | ratio |
 |---|---|---|---|---|
@@ -109,20 +88,15 @@ factorized_count`):
 | 1,000 | 1,000,000 | 1.17 s | 3.05 ms | 384× |
 | 4,000 | 16,000,000 | 19.5 s | 12.6 ms | 1,556× |
 
-The ratio doubles with K because the fold is linear while the enumeration is quadratic; a
-16-million-result join counts in 12.6 ms. Two admissions keep it exact, both found by this
-crate's differentials: variable-bearing stores stay on the enumerating path (a stored bare
-`$x` unifies with any factor but is invisible to a prefix seek — pinned as a test), and a
-variable nested in a compound column declines (the documented #130 fragment).
+Two admissions keep it exact, both found by this crate's differentials: variable-bearing
+stores stay on the enumerating path, and a variable nested in a compound column declines.
 
 ### Repeated queries replay in O(answers)
 
-The space tables the matcher's raw result rows per encoded pattern (an
-alpha-invariant key), invalidated by the mutation generation. A replay decodes
-the rows afresh — new variable ids per result, the mutable-grounded live filter
-re-applied — so it is indistinguishable from a live match, and it costs the
-answers, not the store. The worst-case shape is a variable-functor pattern
-`($x mid $y)`, which neither the trie descent nor the column index can take
+The space tables the matcher's raw result rows per encoded pattern (an alpha-invariant key),
+invalidated by the mutation generation; a replay decodes the rows afresh, so it is
+indistinguishable from a live match and costs the answers, not the store. The worst-case
+shape is `($x mid $y)`, which neither trie descent nor the column index can take
 (`cargo run --release --example query_tabling`):
 
 | N | first call (scan + fill) | tabled replay | ratio |
@@ -131,22 +105,14 @@ answers, not the store. The worst-case shape is a variable-functor pattern
 | 400,000 | 10.7 ms | 1.66 µs | 6,446× |
 | 1,600,000 | 42.1 ms | 1.66 µs | 25,357× |
 
-Unlike the byte-seek paths, tabling needs no var-freeness latch: the replayed
-rows are the unifier's own output, schematic data included. Conjunctive
-queries ride the same cache, so a repeated join replays without re-running the
-join. Memory stays proportional to queries that pay, not to query traffic: the
-auto-tabler admits a fill only when its measured matcher cost clears a
-threshold (50 µs release), so point lookups never occupy a cache entry, on top
-of the hard caps (256 shapes per space, 4,096 rows per shape) and generation
-invalidation — the same worth-gate / bounded-store / dirty-invalidation trio
-MeTTa TS's auto-tabler uses, with measured wall cost as the worth signal.
+Conjunctive queries ride the same cache. Fills are worth-gated (a fill must clear 50 µs of
+measured matcher cost) and bounded (256 shapes per space, 4,096 rows per shape), so point
+lookups never occupy a cache entry.
 
-### The compute lane: semi-naive fixpoints, measured on the kernel's own dish
+### Semi-naive fixpoints, on the kernel's own dish
 
-`step()` under the `semi-naive` feature on the kernel's `process_calculus`
-workload (Peano x+y by message passing, the dish where PR #128 counts 98.8% of
-naive match candidates as redundant), via
-`cargo run --release --features semi-naive --example process_calculus_step`:
+`step()` under `semi-naive` on the kernel's `process_calculus` workload
+(`cargo run --release --features semi-naive --example process_calculus_step`):
 
 | workload | naive | semi-naive | ratio |
 |---|---|---|---|
@@ -154,39 +120,29 @@ naive match candidates as redundant), via
 | 80+80, 400 steps | 2.38 s | 122 ms | 19.6× |
 | 200+200, 1000 steps | 35.9 s | 1.23 s | 29.1× |
 
-The ratio grows with size — the asymptotic signature — and the bridge is
-faithful: PR #128's own control table records 26.5× on the same shape. The
-private fork's further exec-arc work (streamed emit, plan freezing, fast
-paths) compounds beyond this; none of it is in an open PR yet.
+The ratio grows with size — the asymptotic signature — and the bridge is faithful: PR #128's
+own control table records 26.5× on the same shape.
 
 ## MeTTa evaluation on the kernel
 
-`reduce(expr, fuel)` runs evaluation itself as MM2 exec rewriting inside an
-O(1) fork of the space: the expression seeds the dish, one dormant rewrite
-rule (`(mm2-ev $x)` meets `(= $x $y)`) is re-armed each round by the kernel
-benches' IC scheduler, and the fixpoint's equation-free terms come back — the
-MeTTa spec's `metta_call` fallback semantics on the outermost term-rewriting
-fragment. Accumulator-style recursion normalizes (`(add (S (S Z)) (S (S (S
-Z))))` → `(S (S (S (S (S Z)))))`), nondeterministic equations return every
-branch, and the live space never sees the scaffolding. Nested-redex programs
-need the congruence lowering — LeaTTa 1.0.8's `MorkMM2Lowering` is the
-mechanized spec for it, CeTTa's `mork:` lane the shipped reference — which is
-the named next step toward the full interpreter on the kernel.
+`reduce(expr, fuel)` runs evaluation itself as MM2 exec rewriting inside an O(1) fork of the
+space: the expression seeds the dish, one dormant rewrite rule is re-armed each round, and
+the fixpoint's equation-free terms come back — the MeTTa spec's `metta_call` fallback
+semantics on the outermost term-rewriting fragment. Accumulator recursion normalizes,
+nondeterministic equations return every branch, and the live space never sees the
+scaffolding. Nested redexes need the congruence lowering (LeaTTa 1.0.8's `MorkMM2Lowering`
+is the mechanized spec, CeTTa's `mork:` lane the shipped reference) — the named next step
+toward the full interpreter on the kernel.
 
 ## The chaining metamath suite, unmodified
 
-`cargo run --release --example run_mm2 -- <file.mm2>` runs an MM2 program file on
-`MorkSpace` the way `mork run` does on the kernel binary, but purely through this
-crate: `add_sexpr_text` to load, `step()` to drive the exec scheduler to fixpoint,
-`--count "<pattern>"` to count result atoms. The metamath experiment in
+`cargo run --release --example run_mm2 -- <file.mm2>` runs an MM2 program file purely through
+this crate; the kernel binary built from the same tree produces byte-identical space dumps
+and identical counts on every program below, so the numbers measure the engine, not the
+bridge. The metamath experiment in
 [trueagi-io/chaining](https://github.com/trueagi-io/chaining/tree/main/experimental/metamath)
-(propositional-calculus proof search over ax-1, ax-2, ax-3 and modus ponens) runs
-unmodified, including the `backward-via-forward` ACT pipeline, whose
-`gen-fromNumber.mm2` and `gen-lte.mm2` table generators write and read their `.act`
-files through the crate. On every program below, the kernel binary built from the
-same integration tree produces byte-identical space dumps and identical counts, so
-the numbers measure the engine, not the bridge. Upstream PeTTa (pure Prolog,
-6b7f52f) is the cross-engine baseline, run on the same machine.
+runs unmodified, including the `backward-via-forward` ACT pipeline. Upstream PeTTa (pure
+Prolog, 6b7f52f) is the cross-engine baseline, run on the same machine.
 
 Full forward chaining, `pc-fc.mm2`, all proofs of all theorems up to a depth:
 
@@ -197,56 +153,36 @@ Full forward chaining, `pc-fc.mm2`, all proofs of all theorems up to a depth:
 | 3 | 2,759 | 26 ms | 0.23 s |
 | 4 | 5,469,291 | 49.6 s at 0.95 GB | 252.6 s at 117 GB, 0 solutions counted* |
 
-*PeTTa's depth-4 row is the chaining repo's own published CSV (their machine): it
-ran 252.57 s, peaked at 117 GB, and its output contained no countable solutions.
-This machine has 60 GB, so that leg is quoted rather than rerun; the other PeTTa
-rows are local, and 0.12 s is the interpreter's startup floor. Proof counts differ
-between engines (PeTTa says 72 and 3,421 at depths 2 and 3) because the trie
-stores alpha-equivalent proofs once, and differ from the months-old CSV's MORK
-column (67 / 2,909 / 6,087,113) because the engine itself has moved; today's
-kernel and this crate agree exactly.
+*The PeTTa depth-4 row is the chaining repo's own published CSV (their machine, 117 GB peak,
+no countable solutions in its output); this machine has 60 GB, so that leg is quoted rather
+than rerun. Proof counts differ between engines because the trie stores alpha-equivalent
+proofs once.
 
-Backward chaining emulated by forward chaining, `bfc-xp.mm2`, is the case the
-chaining repo measured MM2 losing to PeTTa by 290x and set aside as too slow. The
-flat guarded join bodies in its expansion rules (`sol x decFn x lte`) are exactly
-what the leapfrog join seeks, but the kernel's dispatch policy required a cyclic
-body and declined them; measuring this suite exposed the gap, and the integration
-kernel now admits an acyclic multiway body whose large factor a bounded-small
-factor guards through a shared whole column (`leapfrog-acyclic-guard`), so the
-`leapfrog` feature routes these by default, no knob:
+Backward chaining emulated by forward chaining, `bfc-xp.mm2`, is the case the chaining repo
+measured MM2 losing by 290× and set aside as too slow. Its flat guarded join bodies are
+exactly what the leapfrog join seeks; measuring this suite exposed the dispatch gap, and the
+integration kernel now admits an acyclic multiway body under a shared-column guard
+(`leapfrog-acyclic-guard`), routed by default, no knob:
 
 | target | upstream quote (their Xeon) | unrouted product | routed (the default now) | PeTTa `obc`, local |
 |---|---|---|---|---|
 | jarr (size 13) | 40.4 s | 17.1 s | **94 ms** | 0.13 s |
 | imim1 (size 15) | 25 m 5 s | over 595 s (capped) | **564 ms** | 0.17 s |
 
-The routed times include the kernel's subterm-cursor rework (incremental completion
-state plus unary-spine skipping, `leapfrog-acyclic-guard` second commit), which took
-the join's profile share from about 40% to 16% with byte-identical dumps; before it
-the routed runs measured 140 ms and 875 ms.
-
-Both engines find the same proofs (two for jarr, one for imim1), the routed and
-unrouted space dumps are byte-identical, and the kernel's own counters show where
-the 117x on jarr comes from: 220,380,293 transitions collapse to about 30,000.
-The whole-column requirement on both sides of the guard is what keeps the routing
-directional: `pc-fc.mm2`'s single-fact rule base shares its variables only inside
-nonground compounds, so its enumeration-shaped bodies stay on the product path
-(depth 3 holds at 26 ms, where forcing them through the join with
-`MORK_LEAPFROG=all` costs 1.4x). Semi-naive stepping cannot help this program
-family: the respawned rules bake fresh ground constants each round, so every
-round's rule is genuinely new and its correct delta is the full input; measured
-1.09x at forward depth 4 and nothing on `bfc-xp.mm2`.
+Both engines find the same proofs, routed and unrouted dumps are byte-identical, and the
+kernel's counters locate the 117× on jarr: 220,380,293 transitions collapse to about 30,000.
+The routing stays directional: `pc-fc.mm2`'s enumeration-shaped bodies hold the product path
+(depth 3 at 26 ms; forcing the join with `MORK_LEAPFROG=all` costs 1.4×), and semi-naive
+cannot help this family because each round's respawned rule is genuinely new (1.09× at
+depth 4, nothing on `bfc-xp.mm2`).
 
 ## The whole chaining repository, differentially
 
-Every one of the 121 `.metta` programs in trueagi-io/chaining runs on MorkSpace as
-the interpreter's `&self` (`cargo run --release -p mork-demo --example
-chaining_sweep -- <file.metta> mork` in hyperon-experimental), and a sweep compares
-each against a stock GroundingSpace run of the same file. Comparison is tiered so
-every claim says exactly how strong the equivalence is; the alpha tier parses each
-result atom, assert-error contents included, and renumbers variables by first
-preorder occurrence, so coreference topology counts (the definition
-MeTTa-Compiler's `atoms_are_alpha_equivalent` uses):
+All 121 `.metta` programs in trueagi-io/chaining run on MorkSpace as the interpreter's
+`&self` (`chaining_sweep` in hyperon-experimental), each compared against a stock
+GroundingSpace run of the same file. Comparison is tiered so every claim says exactly how
+strong the equivalence is; the alpha tier renumbers variables by first preorder occurrence,
+so coreference topology counts:
 
 | tier | files | meaning |
 |---|---|---|
@@ -257,151 +193,107 @@ MeTTa-Compiler's `atoms_are_alpha_equivalent` uses):
 | timeout on both at 90 s | 1 | proven equal at a 590 s cap |
 | open | 1 | `pc-bc-fa`, below |
 
-The sweep drove three fixes to the query path. Decode was rebuilding captured
-expressions as fresh atoms, losing hyperon's `is_evaluated` flag, so the
-interpreter re-entered evaluated results as calls; encode now records evaluated
-query-subexpression spans and decode restores the flag. Result rows now sort by a
-specificity key (longer exact-byte agreement with the pattern first, the order
-GroundingSpace's trie yields by exploring exact branches before variable ones),
-which also brought four heavy inference-control searches that previously timed out
-only on MorkSpace under the cap. And results are narrowed to the query's own
-variables through hyperon's `match_atoms`, GroundingSpace's own pipeline, so
-stored-fact helper variables cannot leak into recursive interpreter bindings.
+The sweep drove three query-path fixes: decode now restores hyperon's `is_evaluated` flag,
+results sort by a specificity key (the order GroundingSpace's trie yields), and results
+narrow to the query's own variables through hyperon's `match_atoms`. Two boundaries are
+deliberate. Equal-specificity order is trie order, not insertion order — a set-semantics trie
+has no insertion history, and the sidecar that tracked one measured a 16× parallel-load
+regression for an ordering MeTTa leaves unspecified. And `pc-bc-fa` stays open because its
+reference is not well-defined: two fresh GroundingSpace processes disagree with each other on
+8 of its 69 proofs, and MorkSpace's difference against one grounding run sits in that same
+noise class, proof counts agreeing.
 
-Two boundaries are deliberate. Equal-specificity result order is trie order, not
-insertion order: a set-semantics trie has no insertion history, and the sidecar
-that tracked one measured a 16x parallel-load regression for an ordering MeTTa
-leaves unspecified. And `pc-bc-fa` stays open because its reference is not
-well-defined: two fresh GroundingSpace processes disagree with each other on 8 of
-its 69 proofs (upstream `Bindings::narrow_vars` picks equality-class
-representatives while iterating `HashSet`s), and MorkSpace's difference against
-one grounding run sits in that same noise class, with proof counts agreeing.
-
-The narrowing and ordering work costs the matcher decode path about half a
-microsecond on a warm point query (~4.2 µs, against GroundingSpace's ~16 µs) and
-nothing anywhere else: ground fact spans skip the rematch, all-ground rows skip
-the narrow, the latch-guarded index route never narrows, and the sort key is
-built only when two or more rows need ordering. The column-index seek holds at
-768 ns steady (80,240x over the scan at 1.6M), tabled replay at 1.66 µs, the
-shared-space parallel query at 1.06 µs at 16 threads, and the 1M-atom parallel
-load at 16 ms.
+The correctness work costs about half a microsecond on a warm point query (~4.2 µs against
+GroundingSpace's ~16 µs) and nothing on the fast paths: column seek 768 ns steady, tabled
+replay 1.66 µs, shared-space parallel query 1.06 µs at 16 threads, 1M-atom parallel load
+16 ms.
 
 ## Against stock GroundingSpace
 
 Same workload (load N `(edge nK nK+1)` atoms, then a point query), measured back to back
-(`cargo run --release --example scale_showcase` here, the `grounding_bench` example in
-`hyperon-experimental/lib` for the baseline):
+(`--example scale_showcase` here, `grounding_bench` in hyperon-experimental for the
+baseline):
 
 | N | load (Grounding → Mork) | point query (Grounding → Mork warm) |
 |---|---|---|
 | 100,000 | 114 ms → **13.7 ms** | ~16 µs → **~4.2 µs** |
 | 500,000 | 935 ms → **69.1 ms** | ~16 µs → **~4.2 µs** |
 
-Load is 8–14× faster and a warm point query about 4× (the half-microsecond over the
-earlier 3.7 µs is the matched-fact span capture the variable-leak fix needs); a 1M-atom
-load lands in 154 ms sequential, 16 ms across 16 threads. A cold
-first query (a shape MORK has not seen) is ~30 µs against GroundingSpace's ~16 µs, both flat
-in N.
+Load is 8–14× faster and a warm point query about 4×; a 1M-atom load lands in 154 ms
+sequential, 16 ms across 16 threads. A cold first query (a shape MORK has not seen) is
+~30 µs against GroundingSpace's ~16 µs, both flat in N.
 
 ## Parallel querying, on one shared space
 
-`MorkSpace` itself is now `Send + Sync` (a compile-time assertion in the test suite): one
-live space object is shared by plain reference across threads — no snapshots, no clones.
-`cargo run --release --example shared_space_parallel` alternates trie-descent point queries
-and column-index seeks from every thread against the same space: 3.2 µs/query at 1 thread
-to 1.06 µs/query at 16 threads (320,000 queries, every result asserted). `MorkSnapshot`
-remains the frozen-view option (`--example parallel_query`), carrying the column indexes for
-~780 ns seeks. Matcher-path thread scaling is sublinear because the upstream kernel keeps
-process-global matcher counters that all threads write; the private fork's per-thread
-accumulation is not yet in any upstream PR.
+`MorkSpace` is `Send + Sync` (compile-time asserted): one live space object is shared by
+plain reference across threads — no snapshots, no clones.
+`cargo run --release --example shared_space_parallel` alternates trie-descent queries and
+column seeks from every thread: 3.2 µs/query at 1 thread to 1.06 µs at 16 (320,000 queries,
+every result asserted); `MorkSnapshot` remains the frozen view at ~780 ns. Matcher-path
+scaling is sublinear because the upstream kernel keeps process-global matcher counters; the
+per-thread fix is not in any open PR yet.
 
-`extend_parallel(atoms, threads)` bulk-loads on PathMap's own architecture — per-thread
-private tries built without contention, merged by structural join (shared subtrees, no deep
-copies): 1M atoms in 20.3 ms at 16 threads against 289 ms for the sequential add loop
-(`cargo run --release --example parallel_load`), parity-sealed against sequential adds by
-proptest. `fork()` is the copy-on-write branch-and-explore primitive: an O(1) clone of the whole space
-(trie, registry, indexes, tabled queries share structure until a side mutates) where a
-per-atom copy is O(N). `union_with`/`intersect_with`/`subtract_space` run PathMap's
-join/meet/subtract on the trie structure itself, sharing common subtrees with both operands
-instead of iterating atoms; they decline on stores holding mutable grounded atoms (space-local
-identity ids), and a proptest differential holds each equal to per-atom set semantics.
+`extend_parallel(atoms, threads)` builds per-thread private tries and merges by structural
+join: 1M atoms in 20.3 ms at 16 threads against 289 ms sequential
+(`--example parallel_load`), parity-sealed against sequential adds by proptest. `fork()` is
+an O(1) copy-on-write clone of the whole space, and
+`union_with`/`intersect_with`/`subtract_space` run PathMap's join/meet/subtract on the trie
+structure itself, sharing subtrees with both operands; they decline on stores holding mutable
+grounded atoms, and a proptest differential holds each equal to per-atom set semantics.
 
-## PSPACE-class search as saturation: the demos/ directory
+## Hard search as saturation: the demos/ directory
 
-Four demonstrators run hard-class search directly on the kernel's fact engine,
-each gated by an exact external oracle. They compose the engine features this
-crate exposes: quiesce-headed barrier staging, guarded emission (stored De
-Bruijn schemas drop covered candidates, which is nogood learning and
-stratified negation-as-absence in one mechanism), subsumption-schema pruning,
-and small-table retrieval joins.
+Six demonstrators run hard-class search directly on the kernel's fact engine, each gated by
+an exact external oracle. They compose quiesce-headed barrier staging, guarded emission
+(stored De Bruijn schemas drop covered candidates — nogood learning and stratified
+negation-as-absence in one mechanism), subsumption pruning, and small-table retrieval joins.
 
-- `demos/tqbf`: QBF at three levels. tqbf_cegis/tqbf_v1 decide the
-  forall-exists fragment by flat counterexample-guided expansion, driver-
-  staged or as one barrier-staged engine program per CEGIS round; tqbf_v2
-  decides FULL TQBF (arbitrary quantifier alternations, QDIMACS accepted)
-  by recursive expansion CEGAR, the RAReQS game with a once-built dual and
-  engine-run existential leaves. Verdicts are exact against a recursive
-  oracle on every battery: 327 fragment verdicts, and v2 differentials at
-  2 through 12 quantifier blocks under both leading quantifiers plus
-  adversarial edge batteries (`tqbf_v1.py 0 0 0 edge`, `tqbf_v2.py edge`).
-  Per-depth forbidden schemas cut the explored assignment tree from 510
-  nodes to 71 on the measured instance; wide selector leaves created by
-  nested duals run on an exact host solver at the kernel's documented
-  arity-63 row envelope (MORK wiki, Data-in-MORK).
-- `demos/plan`: 8-puzzle planning by bidirectional meet-in-the-middle under
-  barrier staging. On six instances at optimal distances 8 to 20 the meet
-  depth equals the BFS oracle exactly; at distance 20 the forward frontier
-  visits 54,802 states in 1.54s while the bidirectional meet visits 1,412 in
-  0.12s.
-- `demos/countdp`: derivation counting without enumeration (dynamic
-  programming over theorem-schema states with in-engine products). The
-  committed oracle dump checks it exactly at Hf=9 out of the box
-  (3/6/24/132/729 per stratum); REPORT.md records the larger measured scales
-  and how to regenerate their enumerations.
-- `demos/subsume`: forward proof closure under most-general-schema
-  subsumption. `run_coverage.py` regenerates programs, runs both closures,
-  and checks the antichain coverage law at any Hf; REPORT.md records the
-  measured 310.5s -> 377ms at Hf=12 from the working runs.
-- `demos/exphalving`: exponent halving on the meet-in-the-middle metamath
-  prover. Moving the meet point deeper into the forward antichain collapses
-  the searched `sol` state space, because the forward side stays an
-  antichain under subsumption while the backward side branches: jarr
-  1,294 -> 83 states (15.6x), imim1 6,108 -> 918 (6.7x), loowoz 25,501 -> 2,170
-  (11.8x). Every proof is independently type-checked against the three
-  axioms by `verify_proof.py`, which never consults the search and rejects a
-  corrupted proof as its negative control. The forward antichain is
-  target-independent (one shared lemma base for every theorem) and only
-  affordable because the sink route rides semi-naive and the WCO join (the
-  closure itself went 7.0s -> 0.10s in the same session). Two harder targets
-  in the working set (loolin, pm2.83) do not bisect at the meet points tried
-  and return no proof, which REPORT.md records as a property of
-  bidirectional search rather than an engine limitation; this is a
-  base-and-constant win on real instances, not a complexity-class change.
+- `demos/tqbf`: QBF at three levels — the forall-exists fragment by flat
+  counterexample-guided expansion, and full TQBF (arbitrary quantifier alternations, QDIMACS
+  accepted) by recursive expansion CEGAR with a once-built dual. Verdicts are exact against a
+  recursive oracle on every battery (327 fragment verdicts; v2 differentials at 2–12
+  quantifier blocks plus adversarial edges). Per-depth forbidden schemas cut the explored
+  assignment tree 510 → 71 on the measured instance; wide selector leaves run at the kernel's
+  documented arity-63 envelope.
+- `demos/plan`: 8-puzzle bidirectional meet-in-the-middle under barrier staging; the meet
+  depth equals the BFS oracle on six instances at optimal distances 8–20. At distance 20 the
+  forward frontier visits 54,802 states in 1.54 s, the bidirectional meet 1,412 in 0.12 s.
+- `demos/countdp`: derivation counting without enumeration — dynamic programming over
+  theorem-schema states with in-engine products. The committed oracle dump checks Hf=9
+  exactly out of the box (3/6/24/132/729 per stratum).
+- `demos/subsume`: forward proof closure under most-general-schema subsumption; the antichain
+  coverage law checks at any Hf; measured 310.5 s → 377 ms at Hf=12.
+- `demos/exphalving`: deeper meet-in-the-middle on the metamath prover. Moving the meet point
+  deeper into the forward antichain collapses the searched state space: jarr 1,294 → 83
+  states (15.6×), imim1 6,108 → 918 (6.7×), loowoz 25,501 → 2,170 (11.8×), every proof
+  independently type-checked (`verify_proof.py`, with a negative control). Two working-set
+  targets do not bisect at the meet points tried — a property of bidirectional search,
+  recorded as such.
+- `demos/pcgraph`: predictive-coding settles as store saturation — a 2-2-2 ePC XOR chain
+  whose K=16 inner error updates match the jpc oracle cell-by-cell, with in-store
+  weight-update phases and learning gates, plus a store-native iPC variant that applies the
+  same local fold every tick.
 
 Set `MORK_BIN` to a MORK kernel binary built with
 `--features semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,retrieval_join`
-(`demos/exphalving` additionally needs `witness_select`) and run any driver
-with python3; each REPORT.md records the measured numbers and the honest
-scope of its claim. Of these features, `semi_naive_ic` and `leapfrog` are in
-the open PR set; `stratified_quiescence`, `guarded_emit`, `retrieval_join`,
-and `witness_select` are fork features not yet PR'd upstream. Branch
-[`metta-on-mork-base`](https://github.com/MesTTo/MORK/tree/metta-on-mork-base)
-of the fork carries the full lineage (a superset of `upstream-plus-prs`), and
-a kernel built from it with the features above reproduces every driver. The
-MM2 semantics these programs rely on
-is the one LeaTTa's `morkEncodedSpaceBackend` law pins operationally: the
-serial fold over the encoded space, with every fast path byte-identical to
-the reference matcher.
+(`demos/exphalving` additionally needs `witness_select`) and run any driver with python3;
+each REPORT.md records the measured numbers and the honest scope of its claim. Of these
+features, `semi_naive_ic` and `leapfrog` are in the open PR set; `stratified_quiescence`,
+`guarded_emit`, `retrieval_join`, and `witness_select` are fork features not yet PR'd
+upstream. Branch
+[`metta-on-mork-base`](https://github.com/MesTTo/MORK/tree/metta-on-mork-base) of the fork
+carries the full lineage (a superset of `upstream-plus-prs`), and a kernel built from it with
+the features above reproduces every driver. The MM2 semantics these programs rely on is the
+one LeaTTa's `morkEncodedSpaceBackend` law pins operationally: the serial fold over the
+encoded space, with every fast path byte-identical to the reference matcher.
 
 ## WILLIAM, carried in-crate
 
 `compression_gain_index(ref_cost)` builds the whitepaper-5.12 term-boundary compression-gain
-index over the stored atoms (every whole-subexpression prefix shared by ≥2 atoms weighted by
-the bytes factoring it would save), and `frequent_subpatterns(k, ref_cost)` reports the k
-heaviest patterns as a prefix-free antichain, rendered as readable MeTTa. The upstream kernel's
-`weighted_paths` sidecar (PR #101) stops at weight bookkeeping, so the compression-gain
-builder, the maximal top-k, and the pattern renderer live in this crate (`src/william.rs`),
-byte-compatible with the optimized fork's index.
+index over the stored atoms, and `frequent_subpatterns(k, ref_cost)` reports the k heaviest
+patterns as a prefix-free antichain in readable MeTTa. The upstream `weighted_paths` sidecar
+(PR #101) stops at weight bookkeeping; the gain builder, maximal top-k, and renderer live in
+`src/william.rs`, byte-compatible with the optimized fork's index.
 
 ## Use
 
@@ -436,42 +328,36 @@ RUSTFLAGS="-C target-cpu=native" cargo +nightly run --release --example scale_sh
 ## How it works
 
 `encode_atom` walks a Hyperon `Atom` into MORK's preorder byte encoding
-(`Arity`/`SymbolSize`/`NewVar`/`VarRef`), tracking variables in introduction order, and
-`decode_atom` walks the bytes back. `add` and `remove` insert and remove those bytes in the
-trie. `query` encodes the pattern (each conjunct of a `(, ...)` query as its own factor),
-calls `query_multi`, and reads binding `(0, i)` for the i-th variable, decoding each bound
-sub-expression back into an `Atom`. `atom_count` is `val_count`, and `visit` iterates the trie
-with a read zipper. Symbols are stored as raw bytes, which is MORK's default.
-
-The byte-level fast paths (the column index, the factorized count) are gated by a one-way
-var-freeness latch: while every stored atom is variable-free they are admitted, and the first
-variable-bearing `add`, `add_sexpr_text` containing `$`, or `step()` sends all queries back to
-the general matcher, which unifies stored variables correctly. Routing changes complexity,
-never answers — a proptest invariant holds the routed query equal to the raw matcher on every
-query shape.
+(`Arity`/`SymbolSize`/`NewVar`/`VarRef`), `decode_atom` walks the bytes back; `add` and
+`remove` insert and remove those bytes in the trie; `query` encodes each conjunct as its own
+factor of one `query_multi` call and decodes the bindings. `atom_count` is `val_count`,
+`visit` iterates with a read zipper, symbols are stored as raw bytes. The byte-level fast
+paths sit behind a one-way var-freeness latch: while every stored atom is ground they are
+admitted, and the first variable-bearing add sends all queries back to the general matcher,
+which unifies stored variables correctly. Routing changes complexity, never answers — a
+proptest invariant holds every routed query equal to the raw matcher on every query shape.
 
 ## Limitations
 
-- `MorkSpace` is `Send + Sync` on the `send-sync-atoms` hyperon branch; sharing it across
-  threads gives reader parallelism (`query` is `&self`). Mutation needs `&mut` or an outer
-  lock, as usual.
-- Grounded atom boundaries. Immutable grounded atoms are content-addressed by display string.
-  Mutable grounded atoms such as `State` are stored by per-instance identity and matched by
-  current live value. Snapshots and sharded spaces carry no grounded registry, so they are for
-  immutable content-addressed data.
-- `remove` of a mutable-grounded atom uses the content key, so an atom stored by mutable
-  identity id cannot be removed by reconstructing the value key.
+- `MorkSpace` is `Send + Sync` on the `send-sync-atoms` hyperon branch; sharing gives reader
+  parallelism (`query` is `&self`), mutation needs `&mut` or an outer lock.
+- Immutable grounded atoms are content-addressed by display string; mutable ones (`State`)
+  are stored by per-instance identity and matched by current live value. Snapshots and
+  sharded spaces carry no grounded registry, so they are for immutable content-addressed
+  data.
+- `remove` of a mutable-grounded atom uses the content key, so an atom stored by identity id
+  cannot be removed by reconstructing the value key.
 - The var-freeness latch is one-way: after the first variable-bearing add, text load with
-  `$`, or `step()`, the byte-level fast paths stay off for that space's lifetime (correctness
-  first; the matcher path handles every shape).
+  `$`, or `step()`, the byte-level fast paths stay off for that space's lifetime.
 - Symbol and arity at most 63, from MORK's 6-bit fields; a conjunction takes at most 62
-  conjuncts. `add` rejects atoms outside the encoding and increments `rejected_atom_count()`.
+  conjuncts. `add` rejects atoms outside the encoding and increments
+  `rejected_atom_count()`.
 
 ## Layout
 
-- `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the byte-level codec, conjunctive
-  encoding, the factorized count, direct `transform`, prefix restriction, paths persistence,
-  `reduce`, `fork`, the trie algebra, parallel loading, and the differential test suite.
+- `src/lib.rs` — `MorkSpace`, the `Space`/`SpaceMut` impls, the codec, conjunctive encoding,
+  the factorized count, direct `transform`, prefix restriction, paths persistence, `reduce`,
+  `fork`, the trie algebra, parallel loading, and the differential test suite.
 - `src/argindex.rs` — the argument-position (column) index: build, seek, classify.
 - `src/william.rs` — the WILLIAM compression-gain index and pattern report.
 - `examples/conjunctive_join.rs` — WCO join scaling and the #1076 reproduction.
@@ -479,10 +365,9 @@ query shape.
 - `examples/factorized_count.rs` — factorized versus enumerating conjunctive counts.
 - `examples/query_tabling.rs` — tabled replay against the live scan.
 - `examples/shared_space_parallel.rs` — one `Send + Sync` space shared across threads.
-- `examples/run_mm2.rs` — run any MM2 program file on `MorkSpace`; the chaining
-  metamath suite runs unmodified.
-- `examples/semi_naive_step.rs` — naive versus semi-naive fixpoint stepping.
-- `examples/process_calculus_step.rs` — the kernel's process-calculus dish, naive versus semi-naive.
+- `examples/run_mm2.rs` — run any MM2 program file on `MorkSpace`.
+- `examples/semi_naive_step.rs`, `examples/process_calculus_step.rs` — naive versus
+  semi-naive fixpoints.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
 
@@ -490,14 +375,15 @@ query shape.
 
 [`metta-quantimork-transformer.pdf`](metta-quantimork-transformer.pdf) is the technical
 report on the programme this substrate serves: GPT-2 (124M) re-expressed as a
-predictive-coding network by homotopy distillation, near-losslessly and reproducibly; the
-measured rank concentration of its update mass; and the companion result that runs the same
-transformer's forward pass natively inside the MORK store. It is a work-in-progress report
-and states what is established and what is not.
+predictive-coding network by homotopy distillation, the measured rank concentration of its
+update mass, and the companion result running the same transformer's forward pass natively
+inside the MORK store. It is a work-in-progress report and states what is established and
+what is not.
 
 ## License
 
-GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`), Copyright (C) 2026 MesTTo. See
-[LICENSE](LICENSE); each source file carries an SPDX header and copyright notice. Revisions
-before the relicense commit were MIT and keep that grant. The dependencies keep their own
-licenses: Hyperon (`hyperon-atom`, `hyperon-space`, `hyperon-common`) and MORK/PathMap.
+GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`), Copyright (C) 2026 MesTTo.
+See [LICENSE](LICENSE); each source file carries an SPDX header and copyright notice.
+Revisions before the relicense commit were MIT and keep that grant. The dependencies keep
+their own licenses: Hyperon (`hyperon-atom`, `hyperon-space`, `hyperon-common`) and
+MORK/PathMap.
