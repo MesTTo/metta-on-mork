@@ -486,6 +486,15 @@ query shape.
 - `examples/scale_showcase.rs`, `examples/query_warmup.rs`, `examples/parallel_query.rs` —
   load, cold/warm query, and parallel snapshot benchmarks.
 
+## The transformer programme
+
+[`metta-quantimork-transformer.pdf`](metta-quantimork-transformer.pdf) is the technical
+report on the programme this substrate serves: GPT-2 (124M) re-expressed as a
+predictive-coding network by homotopy distillation, near-losslessly and reproducibly; the
+measured rank concentration of its update mass; and the companion result that runs the same
+transformer's forward pass natively inside the MORK store. It is a work-in-progress report
+and states what is established and what is not.
+
 ## License
 
 GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`), Copyright (C) 2026 MesTTo. See
