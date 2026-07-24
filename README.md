@@ -405,6 +405,10 @@ every routed query equal to the raw matcher on every query shape.
 
 ## Limitations
 
+- A space is a set, not a bag: the carrier is `PathMap<()>`, so adding an atom twice stores
+  one path, a query matches it once, and one `remove` deletes it. Hyperon's `GroundingSpace`
+  counts duplicates. Counted keys or a count-valued trie is the bag-conformant variant;
+  neither is implemented here yet.
 - Immutable grounded atoms are content-addressed by display string; mutable ones (`State`)
   are stored by per-instance identity and matched by current live value. Snapshots and
   sharded spaces carry no grounded registry, so they are for immutable content-addressed
