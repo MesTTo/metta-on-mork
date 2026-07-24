@@ -142,9 +142,13 @@ main with the full set of open MesTTo PRs merged** (27 at this writing;
 [`upstream-plus-prs`](https://github.com/MesTTo/MORK/tree/upstream-plus-prs) on the
 MesTTo/MORK fork is that merge), on clean upstream
 [PathMap](https://github.com/Adam-Vandervorst/PathMap). The hyperon dependency
-(`../hyperon-experimental`) must be on its `send-sync-atoms` branch, which makes atoms and
-spaces thread-safe with the full workspace suite passing — the refactor upstream issue #410
-asks for.
+(`../hyperon-experimental`) must be on the
+[`send-sync-atoms`](https://github.com/MesTTo/hyperon-experimental/tree/send-sync-atoms)
+branch of the MesTTo hyperon fork (it is not upstream yet; add that fork as a remote and
+check it out), which makes atoms and spaces thread-safe with the full workspace suite
+passing — the refactor upstream issue #410 asks for. Without it, the sequential
+query/evaluator path still builds if you swap the one `extend_parallel` helper for its
+`add` fallback, but the `Send + Sync` parallel path needs the branch.
 
 The kernel's complexity opt-ins pass through as cargo features, each byte-identical to the
 default path by the kernel's own differentials:
