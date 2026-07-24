@@ -813,8 +813,8 @@ impl MorkSpace {
     /// MeTTa's nondeterminism); a term no equation matches returns itself.
     /// This covers accumulator/state-machine style programs (each body's root
     /// is the next redex or a constructor); nested-redex programs need the
-    /// congruence lowering (LeaTTa's MorkMM2Lowering models it; CeTTa's
-    /// mork: lane ships it) -- future work.
+    /// congruence lowering (LeaTTa's MorkMM2Lowering models it) -- future
+    /// work, shipped nowhere yet.
     ///
     /// Runs inside an O(1) [`fork`](Self::fork), so the live space never sees
     /// the evaluation scaffolding; `max_steps` bounds the exec loop (fuel).
