@@ -442,4 +442,6 @@ GPL-2.0-or-later (`SPDX-License-Identifier: GPL-2.0-or-later`), Copyright (C) 20
 See [LICENSE](LICENSE); each source file carries an SPDX header and copyright notice.
 Revisions before the relicense commit were MIT and keep that grant. The dependencies keep
 their own licenses: Hyperon (`hyperon-atom`, `hyperon-space`, `hyperon-common`) and
-MORK/PathMap.
+MORK/PathMap. `src/priority.rs` is ported from F1R3FLY-io/MeTTa-Compiler (Apache-2.0), and
+`demos/exphalving/gen-*.mm2` are vendored from trueagi-io/chaining (GPL-3.0), each credited
+in its file header.

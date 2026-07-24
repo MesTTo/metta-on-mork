@@ -2,7 +2,8 @@
 // Copyright (C) 2026 MesTTo
 //! Priority ordering for evaluation control (Hyperon issue #448).
 //!
-//! Grabbed from F1R3FLY MeTTaTron's `backend/eval/priority.rs` and ported to Hyperon
+//! Grabbed from F1R3FLY MeTTaTron's `backend/eval/priority.rs`
+//! (F1R3FLY-io/MeTTa-Compiler, Apache-2.0) and ported to Hyperon
 //! `Atom`s -- the representation on the HE-MeTTa -> MeTTa-IL -> {MORK + rholang}
 //! path. A planner uses this total order to decide which nondeterministic branch or
 //! exec rule to fire/schedule first. Low to high:
